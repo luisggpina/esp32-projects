@@ -1,8 +1,9 @@
-# Multiple DS18B20 sensors + OLED, reporting over Zigbee to Hubitat
+# Multiple DS18B20 sensors on separate Zigbee endpoints, with Hubitat
 
 A Seeed Studio XIAO ESP32-C6 running as a Zigbee router. It reads up to four DS18B20
-temperature sensors on one 1-Wire bus, shows each reading and their average on an SH1106
-OLED in °F, and sends the average to Hubitat as a Zigbee temperature sensor.
+temperature sensors on one 1-Wire bus and exposes each one as its own Zigbee Temperature
+Measurement endpoint. A Hubitat parent driver turns each endpoint into its own child
+device. The board also shows all four readings on an SH1106 OLED in °F.
 
 Built on [`../../Zigbee_Temperature_Sensor`](../../Zigbee_Temperature_Sensor). See that
 README for the toolchain versions.
@@ -21,18 +22,6 @@ README for the toolchain versions.
 The OLED uses I2C address `0x3C` and the board's default I2C pins, so `Wire.begin()` takes
 no arguments.
 
-All the sensors share one bus. Each DS18B20 has a unique 64-bit address, and the sketch
-prints the addresses at boot:
-
-```
-Found 4 DS18B20 sensor(s)
-  0: 0x...
-  1: 0x...
-```
-
-The sensor numbering (1-4 on the screen) follows the order `search()` finds them in,
-which depends on their addresses, not on how they're wired.
-
 ## Libraries
 
 - **esp32-ds18b20** by junkfix (`OneWireESP32.h`)
@@ -47,44 +36,102 @@ which depends on their addresses, not on how they're wired.
 | Board | XIAO_ESP32C6 |
 | Zigbee mode | Zigbee ZCZR (coordinator/router) |
 | Partition Scheme | Zigbee ZCZR 4MB with spiffs |
-| Erase All Flash Before Sketch Upload | Disabled once paired |
+| Erase All Flash Before Sketch Upload | Enabled for the first upload, then Disabled |
 | USB CDC On Boot | Enabled |
+
+## Sensors and endpoints
+
+Each entry in the `probes[]` table maps one DS18B20 to one Zigbee endpoint:
+
+| Table entry | Zigbee endpoint | Hubitat child |
+|---|---|---|
+| `probes[0]` | 10 (0x0A) | probe 1 |
+| `probes[1]` | 11 (0x0B) | probe 2 |
+| `probes[2]` | 12 (0x0C) | probe 3 |
+| `probes[3]` | 13 (0x0D) | probe 4 |
+
+Every DS18B20 has a unique 64-bit address. Entries left at `0x0` are filled at boot with
+the sensors found on the bus, in `search()` order, which depends on the addresses rather
+than on the wiring. The boot output shows the result:
+
+```
+Found 4 DS18B20 sensor(s)
+  0: 0x...
+Probe 1 -> endpoint 10 -> 0x...
+Probe 2 -> endpoint 11 -> 0x...
+```
+
+To keep each sensor on the same endpoint when sensors are added, removed or replaced,
+copy the addresses into the table:
+
+```cpp
+Probe probes[] = {
+  {"1", 0x28...ULL},
+  {"2", 0x28...ULL},
+  {"3", 0x28...ULL},
+  {"4", 0x28...ULL},
+};
+```
+
+To find out which sensor is which, hold one sensor at a time and watch which reading
+climbs.
+
+Each probe needs a matching `ZigbeeTempSensor` in `zbTemps[]`. A `static_assert` stops the
+build if the two arrays have different lengths. The OLED has room for four probes.
 
 ## What the sketch does
 
-- Every ~1.75 s, it starts a conversion on all sensors, waits 750 ms, and reads each one
+- Every ~1.75 s, it starts a conversion on all sensors, waits 750 ms, and reads each probe
   by its address.
-- The **average of the sensors that read successfully** goes to Zigbee endpoint 10
-  (Temperature Measurement). If every read fails, nothing is sent that cycle.
-- **Screen:** one small line per sensor (`1: 72.5 F`, or `1: --` on a read error), with
-  the average in large text at the bottom (`Avg 72.4F`).
-- Reported range is −55 to 125 °C, with a tolerance of 0.5 °C. Reporting is
-  `setReporting(1, 0, 1)`: at most once per second, and only when the value changes by
-  1 °C or more.
+- Each successful reading goes to that probe's endpoint. A failed read is logged, and that
+  endpoint keeps its last value.
+- **Screen:** one line per probe (`1 72.5F`, or `1 --` on a read error).
+- Reported range is −55 to 125 °C, with a tolerance of 0.5 °C.
+- Reporting: on its own, each endpoint reports at most once per second, and only when the
+  value changes by 1 °C or more. Hubitat's **Configure** replaces this with the driver's
+  settings (below).
 
 ## BOOT button
 
-- **Short press:** reports the temperature immediately.
+- **Short press:** every endpoint reports immediately.
 - **Hold for more than 3 s:** Zigbee factory reset. This removes the board from the
   network, and you'll need to pair it again.
 
+## Hubitat driver
+
+[`../hubitat/esp32c6-multi-ds18b20.groovy`](../hubitat/esp32c6-multi-ds18b20.groovy) is a
+parent driver ("ESP32-C6 Multi DS18B20"). It:
+
+- creates one child device per endpoint, named "<parent name> probe 1" to "probe 4", using
+  Hubitat's built-in **Generic Component Temperature Sensor** driver
+- on **Configure**, binds the Temperature Measurement cluster (`0x0402`) on each endpoint
+  to the hub, and sets up reporting: at least every 10 s, at most every 600 s, on a change
+  of 0.5 °C
+- routes each incoming temperature report to the child for its endpoint, converting to the
+  hub's temperature scale
+- on **Refresh** (parent or child), reads the temperature from the endpoints
+
+Install it under **Drivers Code → New Driver**: paste the file and **Save**.
+
 ## Pairing with Hubitat
 
-1. For the first upload, set **Erase All Flash Before Sketch Upload** to Enabled. Set it
-   back to Disabled before any later upload, or the upload will wipe the pairing.
-2. In Hubitat's Zigbee settings, turn on **Strict Zigbee 3.0**. It only affects joining.
-3. **Double Luck Voodoo:** go to **Settings → Zigbee Details → Rebuild Network**, wait
+1. Install the driver (above).
+2. If the board was paired before with a different set of endpoints, remove that device in
+   Hubitat. The endpoint list is only read when the device joins.
+3. Upload with **Erase All Flash Before Sketch Upload** set to Enabled. Set it back to
+   Disabled before any later upload, or the upload will wipe the pairing.
+4. In Hubitat's Zigbee settings, turn on **Strict Zigbee 3.0**. It only affects joining.
+5. **Double Luck Voodoo:** go to **Settings → Zigbee Details → Rebuild Network**, wait
    until the button is clickable again, then run **Rebuild Network** a second time.
-4. Go to **Devices → Add Device → Zigbee** and wait until Hubitat says it's ready.
-5. Plug the board in, **physically touching the hub**.
-6. The serial output (115200 baud) shows:
+6. Go to **Devices → Add Device → Zigbee** and wait until Hubitat says it's ready.
+7. Plug the board in, **physically touching the hub**.
+8. The serial output (115200 baud) shows:
 
    ```
    Joined network successfully (Extended PAN ID: ..., PAN ID: 0x...., Channel:.., Short Address: 0x....)
    ```
 
-7. On the new device's page, set the driver to
-   **Generic Zigbee Temperature/Humidity Sensor**.
-8. Click **Configure**. From then on, the temperature updates on its own.
-
-Hubitat shows a single temperature, which is the average of the sensors.
+9. On the new device's page, set the driver to **ESP32-C6 Multi DS18B20** and click
+   **Save Device**.
+10. Click **Configure**. The four child devices appear, and from then on each one updates
+    on its own.

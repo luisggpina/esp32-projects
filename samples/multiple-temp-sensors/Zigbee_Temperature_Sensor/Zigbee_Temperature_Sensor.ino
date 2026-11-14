@@ -27,9 +27,9 @@
  */
 
 #include <Arduino.h>
-//#ifndef ZIGBEE_MODE_ED
-//#error "Zigbee end device mode is not selected in Tools->Zigbee mode"
-//#endif
+#ifndef ZIGBEE_MODE_ZCZR
+#error "Zigbee coordinator/router mode is not selected in Tools->Zigbee mode"
+#endif
 
 #include "Zigbee.h"
 #include <Wire.h>
@@ -38,72 +38,91 @@
 #include <OneWireESP32.h>
 
 /* Zigbee temperature sensor configuration */
-#define TEMP_SENSOR_ENDPOINT_NUMBER 10
 uint8_t button = BOOT_PIN;
+
+// One entry per DS18B20. Copy the addresses printed at boot into this table once you
+// know which sensor is which. An entry left at 0 is filled at boot with the next
+// unassigned sensor found on the bus, in search() order.
+struct Probe {
+  const char *label;  // shown on the OLED
+  uint64_t addr;      // DS18B20 64-bit ROM address
+};
+
+Probe probes[] = {
+  {"1", 0x0},
+  {"2", 0x0},
+  {"3", 0x0},
+  {"4", 0x0},
+};
 
 // Optional Time cluster variables
 struct tm timeinfo;
 struct tm *localTime;
 int32_t timezone;
 
-ZigbeeTempSensor zbTempSensor = ZigbeeTempSensor(TEMP_SENSOR_ENDPOINT_NUMBER);
+// One Temperature Measurement endpoint per probe: probes[i] -> endpoint 10 + i
+ZigbeeTempSensor zbTemp1 = ZigbeeTempSensor(10);
+ZigbeeTempSensor zbTemp2 = ZigbeeTempSensor(11);
+ZigbeeTempSensor zbTemp3 = ZigbeeTempSensor(12);
+ZigbeeTempSensor zbTemp4 = ZigbeeTempSensor(13);
+ZigbeeTempSensor *zbTemps[] = {&zbTemp1, &zbTemp2, &zbTemp3, &zbTemp4};
+static_assert(sizeof(zbTemps) / sizeof(*zbTemps) == sizeof(probes) / sizeof(*probes),
+              "need one Zigbee endpoint per probe");
 #define OLED_ADDR 0x3C
 Adafruit_SH1106G display(128, 64, &Wire, -1);
 bool displayOk = false;
 
 /************************ Temp sensor *****************************/
-#define MAX_SENSORS 4
+static bool assigned(uint64_t addr) {
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    if (probes[p].addr == addr) return true;
+  }
+  return false;
+}
 
 static void temp_sensor_value_update(void *arg) {
   OneWire32 ds(D2);
-  uint64_t addr[MAX_SENSORS];
-  uint8_t found = ds.search(addr, MAX_SENSORS);
+  uint64_t addr[(sizeof(probes)/sizeof(*probes))];
+  uint8_t found = ds.search(addr, (sizeof(probes)/sizeof(*probes)));
   Serial.printf("Found %u DS18B20 sensor(s)\r\n", found);
   for (uint8_t i = 0; i < found; i++) {
     Serial.printf("  %u: 0x%llx\r\n", i, addr[i]);
   }
 
+  // Fill table entries left at 0 with sensors not already in the table
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    for (uint8_t i = 0; probes[p].addr == 0 && i < found; i++) {
+      if (!assigned(addr[i])) probes[p].addr = addr[i];
+    }
+    Serial.printf("Probe %s -> endpoint %u -> 0x%llx\r\n", probes[p].label, 10 + p, probes[p].addr);
+  }
+
   for (;;) {
-    if (found) {
-      ds.request();                    // start conversion on all sensors
-      delay(750);
+    ds.request();                    // start conversion on all sensors
+    delay(750);
 
-      float temps[MAX_SENSORS];
-      bool ok[MAX_SENSORS];
-      float sum = 0;
-      uint8_t good = 0;
-      for (uint8_t i = 0; i < found; i++) {
-        ok[i] = (ds.getTemp(addr[i], temps[i]) == 0);
-        if (ok[i]) {
-          sum += temps[i];
-          good++;
-          Serial.printf("Sensor %u: %.2f°C\r\n", i, temps[i]);
-        } else {
-          Serial.printf("Sensor %u: read error\r\n", i);
-        }
+    float temps[(sizeof(probes)/sizeof(*probes))];
+    bool ok[(sizeof(probes)/sizeof(*probes))];
+    for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+      ok[p] = probes[p].addr != 0 && ds.getTemp(probes[p].addr, temps[p]) == 0;
+      if (ok[p]) {
+        Serial.printf("Probe %s: %.2f°C\r\n", probes[p].label, temps[p]);
+        zbTemps[p]->setTemperature(temps[p]);
+      } else {
+        Serial.printf("Probe %s: read error\r\n", probes[p].label);
       }
+    }
 
-      if (good) {
-        float avg = sum / good;
-        Serial.printf("Updated temperature sensor value to %.2f°C (avg of %u)\r\n", avg, good);
-        zbTempSensor.setTemperature(avg);
+    if (displayOk) {
+      display.clearDisplay();
+      display.setTextColor(SH110X_WHITE);
+      display.setTextSize(2);
+      for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+        display.setCursor(0, p * 16);
+        if (ok[p]) display.printf("%s %.1fF", probes[p].label, temps[p] * 9.0 / 5.0 + 32.0);
+        else       display.printf("%s --", probes[p].label);
       }
-
-      if (displayOk) {
-        display.clearDisplay();
-        display.setTextColor(SH110X_WHITE);
-        display.setTextSize(1);
-        for (uint8_t i = 0; i < found; i++) {
-          display.setCursor(0, i * 10);
-          if (ok[i]) display.printf("%u: %.1f F", i + 1, temps[i] * 9.0 / 5.0 + 32.0);
-          else       display.printf("%u: --", i + 1);
-        }
-        display.setTextSize(2);
-        display.setCursor(0, 44);
-        if (good) display.printf("Avg %.1fF", (sum / good) * 9.0 / 5.0 + 32.0);
-        else      display.print("Avg --");
-        display.display();
-      }
+      display.display();
     }
     delay(1000);
   }
@@ -115,7 +134,7 @@ static void builtin_temp_sensor_value_update(void *arg) {
     float tsens_value = temperatureRead();
     Serial.printf("Updated temperature sensor value to %.2f°C\r\n", tsens_value);
     // Update temperature value in Temperature sensor EP
-    zbTempSensor.setTemperature(tsens_value);
+    zbTemp1.setTemperature(tsens_value);
 
     if (displayOk) {
       display.clearDisplay();
@@ -148,27 +167,32 @@ void setup() {
   // Init button switch
   pinMode(button, INPUT_PULLUP);
 
-  // Optional: set Zigbee device name and model
-  zbTempSensor.setManufacturerAndModel("Espressif", "ZigbeeTempSensor");
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    // Optional: set Zigbee device name and model
+    zbTemps[p]->setManufacturerAndModel("Espressif", "ZigbeeTempSensor");
 
-  // Set minimum and maximum temperature measurement value (10-50°C is default range for chip temperature measurement)
-  // zbTempSensor.setMinMaxValue(10, 50);
-  zbTempSensor.setMinMaxValue(-55, 125);
+    // Set minimum and maximum temperature measurement value (10-50°C is default range for chip temperature measurement)
+    // zbTemps[p]->setMinMaxValue(10, 50);
+    zbTemps[p]->setMinMaxValue(-55, 125);
 
-  // Optional: Set default (initial) value for the temperature sensor to 10.0°C to match the minimum temperature measurement value
-  zbTempSensor.setDefaultValue(10.0);
+    // Optional: Set default (initial) value for the temperature sensor to 10.0°C to match the minimum temperature measurement value
+    zbTemps[p]->setDefaultValue(10.0);
 
-  // Optional: Set tolerance for temperature measurement in °C (lowest possible value is 0.01°C)
-  zbTempSensor.setTolerance(0.5);
+    // Optional: Set tolerance for temperature measurement in °C (lowest possible value is 0.01°C)
+    zbTemps[p]->setTolerance(0.5);
+  }
 
   // Optional: Time cluster configuration (default params, as this device will revieve time from coordinator)
-  zbTempSensor.addTimeCluster();
+  // Only needed on one endpoint
+  zbTemp1.addTimeCluster();
 
-  // Add endpoint to Zigbee Core
-  Zigbee.addEndpoint(&zbTempSensor);
+  // Add endpoints to Zigbee Core
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    Zigbee.addEndpoint(zbTemps[p]);
+  }
 
   Serial.println("Starting Zigbee...");
-  // When all EPs are registered, start Zigbee in End Device mode
+  // When all EPs are registered, start Zigbee in Router mode
   if (!Zigbee.begin(ZIGBEE_ROUTER)) {
     Serial.println("Zigbee failed to start!");
     Serial.println("Rebooting...");
@@ -184,8 +208,8 @@ void setup() {
   Serial.println();
 
   // Optional: If time cluster is added, time can be read from the coordinator
-  timeinfo = zbTempSensor.getTime();
-  timezone = zbTempSensor.getTimezone();
+  timeinfo = zbTemp1.getTime();
+  timezone = zbTemp1.getTimezone();
 
   Serial.println("UTC time:");
   Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
@@ -204,7 +228,9 @@ void setup() {
   // if min = 1 and max = 0, reporting is sent only when temperature changes by delta
   // if min = 0 and max = 10, reporting is sent every 10 seconds or temperature changes by delta
   // if min = 0, max = 10 and delta = 0, reporting is sent every 10 seconds regardless of temperature change
-  zbTempSensor.setReporting(1, 0, 1);
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    zbTemps[p]->setReporting(1, 0, 1);
+  }
 }
 
 void loop() {
@@ -222,7 +248,9 @@ void loop() {
         Zigbee.factoryReset();
       }
     }
-    zbTempSensor.reportTemperature();
+    for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+      zbTemps[p]->reportTemperature();
+    }
   }
   delay(100);
 }
