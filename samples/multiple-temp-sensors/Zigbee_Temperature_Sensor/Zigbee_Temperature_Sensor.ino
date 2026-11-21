@@ -68,6 +68,28 @@ ZigbeeTempSensor zbTemp4 = ZigbeeTempSensor(13);
 ZigbeeTempSensor *zbTemps[] = {&zbTemp1, &zbTemp2, &zbTemp3, &zbTemp4};
 static_assert(sizeof(zbTemps) / sizeof(*zbTemps) == sizeof(probes) / sizeof(*probes),
               "need one Zigbee endpoint per probe");
+
+// Relays (LEDs for now): one On/Off endpoint per relay, endpoints 14-16.
+// Wired GPIO -> resistor -> LED -> GND, so HIGH = on.
+ZigbeePowerOutlet zbRelay1 = ZigbeePowerOutlet(14);
+ZigbeePowerOutlet zbRelay2 = ZigbeePowerOutlet(15);
+ZigbeePowerOutlet zbRelay3 = ZigbeePowerOutlet(16);
+
+struct Relay {
+  uint8_t pin;
+  ZigbeePowerOutlet *ep;
+};
+
+Relay relays[] = {
+  {D7, &zbRelay1},
+  {D8, &zbRelay2},
+  {D9, &zbRelay3},
+};
+
+static void setRelay(uint8_t r, bool on) {
+  digitalWrite(relays[r].pin, on ? HIGH : LOW);
+  Serial.printf("Relay %u (endpoint %u) %s\r\n", r + 1, 14 + r, on ? "on" : "off");
+}
 #define OLED_ADDR 0x3C
 Adafruit_SH1106G display(128, 64, &Wire, -1);
 bool displayOk = false;
@@ -167,6 +189,15 @@ void setup() {
   // Init button switch
   pinMode(button, INPUT_PULLUP);
 
+  // Relays start off
+  for (uint8_t r = 0; r < (sizeof(relays)/sizeof(*relays)); r++) {
+    pinMode(relays[r].pin, OUTPUT);
+    digitalWrite(relays[r].pin, LOW);
+  }
+  zbRelay1.onPowerOutletChange([](bool on) { setRelay(0, on); });
+  zbRelay2.onPowerOutletChange([](bool on) { setRelay(1, on); });
+  zbRelay3.onPowerOutletChange([](bool on) { setRelay(2, on); });
+
   for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
     // Optional: set Zigbee device name and model
     zbTemps[p]->setManufacturerAndModel("Espressif", "ZigbeeTempSensor");
@@ -189,6 +220,10 @@ void setup() {
   // Add endpoints to Zigbee Core
   for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
     Zigbee.addEndpoint(zbTemps[p]);
+  }
+  for (uint8_t r = 0; r < (sizeof(relays)/sizeof(*relays)); r++) {
+    relays[r].ep->setManufacturerAndModel("Espressif", "ZigbeeTempSensor");
+    Zigbee.addEndpoint(relays[r].ep);
   }
 
   Serial.println("Starting Zigbee...");
