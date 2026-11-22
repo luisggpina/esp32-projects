@@ -119,6 +119,12 @@ Relay relays[] = {
   {"Heater",    D7, &zbRelay3},  // endpoint 16
 };
 
+// Relay commands from Hubitat, passed from the Zigbee task to the safety task,
+// which is the only task that switches relays.
+struct RelayCmd { uint8_t relay; bool on; };
+QueueHandle_t cmdQ;
+TaskHandle_t safetyTask = NULL;
+
 static void setRelay(uint8_t r, bool on) {
   digitalWrite(relays[r].pin, on ? HIGH : LOW);
   Serial.printf("%s (endpoint %u) %s\r\n", relays[r].name, 14 + r, on ? "on" : "off");
@@ -146,10 +152,17 @@ static void safety_task(void *arg) {
   if (esp_task_wdt_add(NULL) != ESP_OK) {
     Serial.println("safety: could not subscribe to the task watchdog");
   }
-  // Overflows every 136 years, to 0, benign
-  for (uint32_t pass = 0;; pass++) {
+  uint32_t lastDump = 0;
+  for (;;) {
     esp_task_wdt_reset();
-    if (pass % 5 == 0) {
+
+    RelayCmd c;
+    if (xQueueReceive(cmdQ, &c, pdMS_TO_TICKS(1000)) == pdTRUE) {
+      setRelay(c.relay, c.on);  // Hubitat's command; the purge will hook in here
+    }
+
+    if (millis() - lastDump >= 5000) {
+      lastDump = millis();
       Snapshot s;
       if (xQueuePeek(snapQ, &s, 0) == pdTRUE) {
         for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
@@ -160,7 +173,6 @@ static void safety_task(void *arg) {
         Serial.println("snap: no data yet");
       }
     }
-    delay(1000);
   }
 }
 
@@ -237,9 +249,9 @@ void setup() {
     pinMode(relays[r].pin, OUTPUT);
     digitalWrite(relays[r].pin, LOW);
   }
-  zbRelay1.onPowerOutletChange([](bool on) { setRelay(0, on); });
-  zbRelay2.onPowerOutletChange([](bool on) { setRelay(1, on); });
-  zbRelay3.onPowerOutletChange([](bool on) { setRelay(2, on); });
+  zbRelay1.onPowerOutletChange([](bool on) { onRelayChange(0, on); });
+  zbRelay2.onPowerOutletChange([](bool on) { onRelayChange(1, on); });
+  zbRelay3.onPowerOutletChange([](bool on) { onRelayChange(2, on); });
 
   for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
     zbTemps[p]->setManufacturerAndModel("Espressif", "ZigbeeTempSensor");
@@ -258,6 +270,9 @@ void setup() {
     Zigbee.addEndpoint(relays[r].ep);
   }
 
+  cmdQ = xQueueCreate(8, sizeof(RelayCmd));
+  if (!cmdQ) { Serial.println("command queue alloc failed"); ESP.restart(); }
+
   Serial.println("Starting Zigbee...");
   // When all EPs are registered, start Zigbee in Router mode
   if (!Zigbee.begin(ZIGBEE_ROUTER)) {
@@ -275,7 +290,7 @@ void setup() {
   // Start Temperature sensor reading task
   xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
 
-  xTaskCreate(safety_task, "safety", 4096, NULL, 11, NULL);
+  xTaskCreate(safety_task, "safety", 4096, NULL, 11, &safetyTask);
 
   Serial.println("Connecting to network");
   while (!Zigbee.connected()) {
@@ -293,6 +308,22 @@ void setup() {
     zbTemps[p]->setReporting(1, 0, 1);
   }
 }
+
+
+// Called on every relay change: by the Zigbee task when Hubitat sends a command,
+// and by setState() in whichever task calls it. Changes made by the safety task
+// itself are applied directly; everything else is queued for it.
+static void onRelayChange(uint8_t r, bool on) {
+  if (xTaskGetCurrentTaskHandle() == safetyTask) {
+    setRelay(r, on);
+  } else {
+    RelayCmd c = {r, on};
+    if (xQueueSend(cmdQ, &c, 0) != pdTRUE) {
+      Serial.printf("%s: command queue full, command dropped\r\n", relays[r].name);
+    }
+  }
+}
+
 
 void loop() {
   // Checking button for factory reset
