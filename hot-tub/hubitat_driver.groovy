@@ -1,21 +1,25 @@
 /*
- * ESP32-C6 Multi DS18B20 (parent driver)
+ * ESP32-C6 hot tub controller (parent driver)
  *
- * For a Zigbee device that exposes one Temperature Measurement cluster (0x0402)
- * per endpoint on endpoints 0x0A-0x0D, and one On/Off cluster (0x0006) per
- * endpoint on endpoints 0x0E-0x10. Creates one child device per endpoint, using
- * Hubitat's built-in "Generic Component Temperature Sensor" and
- * "Generic Component Switch" drivers, and routes each endpoint's reports to its
- * child.
+ * For the hot-tub sketch, which exposes:
+ *   - endpoints 0x0A-0x0D: Temperature Measurement (0x0402), one per DS18B20 probe
+ *   - endpoints 0x0E-0x10: On/Off (0x0006) for the big pump, circulation pump and heater
+ *
+ * Creates one child per endpoint, using Hubitat's built-in "Generic Component
+ * Temperature Sensor" and "Generic Component Switch" drivers, and routes each
+ * endpoint's reports to its child. RELAY_NAMES must list the loads in the same
+ * order as relays[] in hot-tub.ino. Child labels are only set when a child is
+ * created; use Reset Child Names to apply RELAY_NAMES to existing children.
  */
 
 import hubitat.zigbee.zcl.DataType
 
 metadata {
-    definition(name: "ESP32-C6 Multi DS18B20", namespace: "luisggpina", author: "Luis Pina") {
+    definition(name: "ESP32-C6 Hot-Tub controller with DS18B20", namespace: "luisggpina", author: "Luis Pina") {
         capability "Configuration"
         capability "Refresh"
         capability "Sensor"
+        command "resetChildNames"
     }
     preferences {
         input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
@@ -24,6 +28,7 @@ metadata {
 
 @groovy.transform.Field static final List<Integer> ENDPOINTS = [0x0A, 0x0B, 0x0C, 0x0D]
 @groovy.transform.Field static final List<Integer> RELAY_ENDPOINTS = [0x0E, 0x0F, 0x10]
+@groovy.transform.Field static final List<String> RELAY_NAMES = ["big pump", "circ pump", "heater"]
 
 void installed() {
     createChildren()
@@ -49,10 +54,16 @@ void createChildren() {
     RELAY_ENDPOINTS.eachWithIndex { Integer ep, int i ->
         String dni = childDni(ep)
         if (!getChildDevice(dni)) {
-            String label = "${device.displayName} relay ${i + 1}"
+            String label = "${device.displayName} ${RELAY_NAMES[i]}"
             addChildDevice("hubitat", "Generic Component Switch", dni,
                            [name: label, label: label, isComponent: false])
         }
+    }
+}
+
+void resetChildNames() {
+    RELAY_ENDPOINTS.eachWithIndex { Integer ep, int i ->
+        getChildDevice(childDni(ep))?.setLabel("${device.displayName} ${RELAY_NAMES[i]}")
     }
 }
 

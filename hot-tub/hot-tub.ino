@@ -13,17 +13,29 @@
 // limitations under the License.
 
 /**
- * @brief This example demonstrates Zigbee temperature sensor.
+ * Hot tub controller for a Seeed XIAO ESP32-C6, running as a Zigbee router
+ * paired with Hubitat (see hubitat_driver.groovy for the parent driver).
  *
- * The example demonstrates how to use Zigbee library to create a end device temperature sensor.
- * The temperature sensor is a Zigbee end device, which is controlled by a Zigbee coordinator.
+ * Based off the sample created by Jan Procházka (https://github.com/P-R-O-C-H-Y/)
  *
- * Proper Zigbee mode must be selected in Tools->Zigbee mode
- * and also the correct partition scheme must be selected in Tools->Partition Scheme.
+ * Modified from Espressif's Zigbee_Temperature_Sensor example to read four
+ * DS18B20 probes, switch three relays and show the readings on an OLED.
  *
- * Please check the README.md for instructions and more detailed description.
+ * Zigbee endpoints:
+ *   10-13  Temperature Measurement, one per entry in probes[]
+ *   14-16  On/Off for the big pump, circulation pump and heater (relays[])
  *
- * Created by Jan Procházka (https://github.com/P-R-O-C-H-Y/)
+ * Wiring:
+ *   D2     1-Wire bus for all four DS18B20s, 4.7k pull-up to 3V3
+ *   D4/D5  SH1106 OLED (I2C SDA/SCL)
+ *   D7     heater relay
+ *   D8     circulation pump relay
+ *   D9     big pump relay
+ *   BOOT   short press: report all temperatures now;
+ *          hold 3 s: factory-reset Zigbee and leave the network
+ *
+ * Build with Zigbee mode ZCZR (coordinator/router) and the zigbee_zczr
+ * partition scheme; the sketch refuses to compile in any other Zigbee mode.
  */
 
 #include <Arduino.h>
@@ -69,27 +81,31 @@ ZigbeeTempSensor *zbTemps[] = {&zbTemp1, &zbTemp2, &zbTemp3, &zbTemp4};
 static_assert(sizeof(zbTemps) / sizeof(*zbTemps) == sizeof(probes) / sizeof(*probes),
               "need one Zigbee endpoint per probe");
 
-// Relays (LEDs for now): one On/Off endpoint per relay, endpoints 14-16.
-// Wired GPIO -> resistor -> LED -> GND, so HIGH = on.
+// Relays: one On/Off endpoint per load, endpoints 14-16 (relays[i] -> endpoint 14 + i).
+// The pins drive the 4-channel opto-isolated DIN relay board, jumpered for high-level
+// trigger, so HIGH = on, and the relays stay off while the ESP32 is unpowered or
+// resetting. Keep the order in sync with RELAY_NAMES in hubitat_driver.groovy.
 ZigbeePowerOutlet zbRelay1 = ZigbeePowerOutlet(14);
 ZigbeePowerOutlet zbRelay2 = ZigbeePowerOutlet(15);
 ZigbeePowerOutlet zbRelay3 = ZigbeePowerOutlet(16);
 
 struct Relay {
+  const char *name;
   uint8_t pin;
   ZigbeePowerOutlet *ep;
 };
 
 Relay relays[] = {
-  {D7, &zbRelay1},
-  {D8, &zbRelay2},
-  {D9, &zbRelay3},
+  {"Big pump",  D9, &zbRelay1},  // endpoint 14
+  {"Circ pump", D8, &zbRelay2},  // endpoint 15
+  {"Heater",    D7, &zbRelay3},  // endpoint 16
 };
 
 static void setRelay(uint8_t r, bool on) {
   digitalWrite(relays[r].pin, on ? HIGH : LOW);
-  Serial.printf("Relay %u (endpoint %u) %s\r\n", r + 1, 14 + r, on ? "on" : "off");
+  Serial.printf("%s (endpoint %u) %s\r\n", relays[r].name, 14 + r, on ? "on" : "off");
 }
+
 #define OLED_ADDR 0x3C
 Adafruit_SH1106G display(128, 64, &Wire, -1);
 bool displayOk = false;
@@ -235,6 +251,11 @@ void setup() {
   } else {
     Serial.println("Zigbee started successfully!");
   }
+
+  // Start Temperature sensor reading task
+
+  xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
+
   Serial.println("Connecting to network");
   while (!Zigbee.connected()) {
     Serial.print(".");
@@ -254,9 +275,6 @@ void setup() {
 
   Serial.println("Local time with timezone:");
   Serial.println(localTime, "%A, %B %d %Y %H:%M:%S");
-
-  // Start Temperature sensor reading task
-  xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
 
   // Set reporting interval for temperature measurement in seconds, must be called after Zigbee.begin()
   // min_interval and max_interval in seconds, delta (temp change in 0,1 °C)
