@@ -49,6 +49,8 @@
 #include <Adafruit_SH110X.h>
 #include <OneWireESP32.h>
 
+#include <esp_task_wdt.h>
+
 /* Zigbee temperature sensor configuration */
 uint8_t button = BOOT_PIN;
 
@@ -132,6 +134,34 @@ static bool assigned(uint64_t addr) {
     if (probes[p].addr == addr) return true;
   }
   return false;
+}
+
+// Safety checks. Runs in its own task, started before the Zigbee wait in
+// setup(), so it keeps running when the hub is unreachable.
+static void safety_task(void *arg) {
+  // Subscribe to the task watchdog. The core's sdkconfig sets a 5 s timeout and a
+  // panic on expiry, so if this task stops feeding it, the board resets and the
+  // relays fail off.
+
+  if (esp_task_wdt_add(NULL) != ESP_OK) {
+    Serial.println("safety: could not subscribe to the task watchdog");
+  }
+  // Overflows every 136 years, to 0, benign
+  for (uint32_t pass = 0;; pass++) {
+    esp_task_wdt_reset();
+    if (pass % 5 == 0) {
+      Snapshot s;
+      if (xQueuePeek(snapQ, &s, 0) == pdTRUE) {
+        for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+          Serial.printf("snap %s: %s %.2f°C, %lu ms old\r\n", probes[p].label,
+                        s.ok[p] ? "ok " : "bad", s.temp[p], (unsigned long)(millis() - s.at[p]));
+        }
+      } else {
+        Serial.println("snap: no data yet");
+      }
+    }
+    delay(1000);
+  }
 }
 
 static void temp_sensor_value_update(void *arg) {
@@ -245,6 +275,8 @@ void setup() {
   // Start Temperature sensor reading task
   xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
 
+  xTaskCreate(safety_task, "safety", 4096, NULL, 11, NULL);
+
   Serial.println("Connecting to network");
   while (!Zigbee.connected()) {
     Serial.print(".");
@@ -263,21 +295,6 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastDump = 0;
-  if (millis() - lastDump > 5000) {
-    lastDump = millis();
-    Snapshot s;
-    if (xQueuePeek(snapQ, &s, 0) == pdTRUE) {  // copy of the latest snapshot
-      for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
-        Serial.printf("snap %s: %s %.2f°C, %lu ms old\r\n", probes[p].label,
-                      s.ok[p] ? "ok " : "bad", s.temp[p], (unsigned long)(millis() - s.at[p]));
-      }
-    } else {
-      // nothing published yet: treat every probe as bad
-      Serial.println("snap: no data yet");
-    }
-  }
-
   // Checking button for factory reset
   if (digitalRead(button) == LOW) {  // Push button pressed
     // Key debounce handling
