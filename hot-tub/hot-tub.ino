@@ -67,11 +67,6 @@ Probe probes[] = {
   {"4", 0x0},
 };
 
-// Optional Time cluster variables
-struct tm timeinfo;
-struct tm *localTime;
-int32_t timezone;
-
 // One Temperature Measurement endpoint per probe: probes[i] -> endpoint 10 + i
 ZigbeeTempSensor zbTemp1 = ZigbeeTempSensor(10);
 ZigbeeTempSensor zbTemp2 = ZigbeeTempSensor(11);
@@ -166,29 +161,6 @@ static void temp_sensor_value_update(void *arg) {
   }
 }
 
-static void builtin_temp_sensor_value_update(void *arg) {
-  for (;;) {
-    // Read temperature sensor value
-    float tsens_value = temperatureRead();
-    Serial.printf("Updated temperature sensor value to %.2f°C\r\n", tsens_value);
-    // Update temperature value in Temperature sensor EP
-    zbTemp1.setTemperature(tsens_value);
-
-    if (displayOk) {
-      display.clearDisplay();
-      display.setTextColor(SH110X_WHITE);
-      display.setTextSize(1);
-      display.setCursor(0, 0);
-      display.println("Chip temperature");
-      display.setTextSize(2);
-      display.setCursor(0, 24);
-      display.printf("%.1f F", tsens_value * 9.0 / 5.0 + 32.0);
-      display.display();
-    }
-    delay(1000);
-  }
-}
-
 /********************* Arduino functions **************************/
 void setup() {
   pinMode(3, OUTPUT);  digitalWrite(3, LOW);   // enable RF switch (active low)
@@ -215,23 +187,12 @@ void setup() {
   zbRelay3.onPowerOutletChange([](bool on) { setRelay(2, on); });
 
   for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
-    // Optional: set Zigbee device name and model
     zbTemps[p]->setManufacturerAndModel("Espressif", "ZigbeeTempSensor");
-
-    // Set minimum and maximum temperature measurement value (10-50°C is default range for chip temperature measurement)
-    // zbTemps[p]->setMinMaxValue(10, 50);
-    zbTemps[p]->setMinMaxValue(-55, 125);
-
-    // Optional: Set default (initial) value for the temperature sensor to 10.0°C to match the minimum temperature measurement value
+    zbTemps[p]->setMinMaxValue(-55, 125);  // DS18B20 measuring range, °C
+    zbTemps[p]->setTolerance(0.5);         // DS18B20 accuracy, ±0.5 °C
+    // Value the endpoint holds until its probe's first good read (not a real reading)
     zbTemps[p]->setDefaultValue(10.0);
-
-    // Optional: Set tolerance for temperature measurement in °C (lowest possible value is 0.01°C)
-    zbTemps[p]->setTolerance(0.5);
   }
-
-  // Optional: Time cluster configuration (default params, as this device will revieve time from coordinator)
-  // Only needed on one endpoint
-  zbTemp1.addTimeCluster();
 
   // Add endpoints to Zigbee Core
   for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
@@ -262,19 +223,6 @@ void setup() {
     delay(100);
   }
   Serial.println();
-
-  // Optional: If time cluster is added, time can be read from the coordinator
-  timeinfo = zbTemp1.getTime();
-  timezone = zbTemp1.getTimezone();
-
-  Serial.println("UTC time:");
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
-
-  time_t local = mktime(&timeinfo) + timezone;
-  localTime = localtime(&local);
-
-  Serial.println("Local time with timezone:");
-  Serial.println(localTime, "%A, %B %d %Y %H:%M:%S");
 
   // Set reporting interval for temperature measurement in seconds, must be called after Zigbee.begin()
   // min_interval and max_interval in seconds, delta (temp change in 0,1 °C)
