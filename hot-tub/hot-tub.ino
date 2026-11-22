@@ -162,6 +162,13 @@ const uint32_t PURGE_IDLE_MS = 4UL * 60 * 60 * 1000;
 const uint32_t PURGE_GAP_MS  = 2000;   // heater off -> big pump on
 const uint32_t PURGE_RUN_MS  = 30000;
 
+// Freeze protection: below 35 °F outside, the circulation pump is forced on and
+// Hubitat can't turn it off; above 38 °F it's released (and stays on until Hubitat
+// turns it off). With no good outside reading for 5 min, assume it's freezing.
+const float    FREEZE_ON_C     = (35.0 - 32.0) / 1.8;
+const float    FREEZE_OFF_C    = (36.0 - 32.0) / 1.8;
+const uint32_t FREEZE_STALE_MS = 5UL * 60 * 1000;
+
 bool wasConnected = false;        // to spot a (re)join
 
 // Relay commands from Hubitat, passed from the Zigbee task to the safety task,
@@ -230,6 +237,9 @@ static void safety_task(void *arg) {
   uint32_t pumpLastOn = millis();   // last time the big pump was seen running
   uint32_t lastDump = 0;
 
+  bool freeze = false;              // freeze protection active
+  bool circWanted = false;          // what Hubitat last asked for the circ pump (off at boot)
+
   uint32_t toggles[5] = {};         // times of the last 5 screen changes from Hubitat
   uint8_t toggleNext = 0, toggleCount = 0;
 
@@ -271,7 +281,13 @@ static void safety_task(void *arg) {
           toggleCount = 0;
         }
       }
-      setRelay(c.relay, c.on);
+      if (c.relay == CIRC_PUMP) circWanted = c.on;
+      if (freeze && c.relay == CIRC_PUMP && !c.on) {
+        Serial.println("freeze protection: circ pump stays on");
+        setRelay(CIRC_PUMP, true);  // the command already set the attribute to off; put it back and tell Hubitat
+      } else {
+        setRelay(c.relay, c.on);
+      }
     }
 
     uint32_t now = millis();
@@ -303,6 +319,22 @@ static void safety_task(void *arg) {
         }
         break;
     }
+
+    // Freeze protection, from the outside probe. Before the first snapshot, s is all
+    // zero, so the probe's last good read is at 0 and it goes stale after 5 min of uptime.
+    Snapshot fs = {};
+    xQueuePeek(snapQ, &fs, 0);
+    bool stale = now - fs.at[P_OUTSIDE] >= FREEZE_STALE_MS;
+    float outside = fs.temp[P_OUTSIDE];  // last good reading
+    bool wasFreeze = freeze;
+    if (stale || outside < FREEZE_ON_C) freeze = true;
+    else if (outside > FREEZE_OFF_C)    freeze = false;
+    if (freeze != wasFreeze) {
+      Serial.printf("freeze protection %s (%s)\r\n", freeze ? "on" : "off",
+                    stale ? "no outside reading for 5 min" : "outside temperature");
+      if (!freeze) setRelay(CIRC_PUMP, circWanted);  // back to what Hubitat last asked for
+    }
+    if (freeze && !relays[CIRC_PUMP].on) setRelay(CIRC_PUMP, true);
 
     if (now - lastDump >= 5000) {
       lastDump = now;
