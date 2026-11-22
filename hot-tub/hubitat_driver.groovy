@@ -95,8 +95,9 @@ List<String> configure() {
         // Bind this endpoint's on/off cluster to the hub
         cmds += "zdo bind 0x${device.deviceNetworkId} 0x${epHex} 0x01 0x0006 {${device.zigbeeId}} {}"
         cmds += "delay 200"
-        // Report on every change, and at least every 10 min
-        cmds += zigbee.configureReporting(0x0006, 0x0000, DataType.BOOLEAN, 0, 600, null, [destEndpoint: ep])
+        // Don't report On/Off: this board's stack crashes on its periodic On/Off
+        // reports. It sends On/Off commands instead (see the header comment).
+        cmds += zigbee.configureReporting(0x0006, 0x0000, DataType.BOOLEAN, 0, 0xFFFF, null, [destEndpoint: ep])
     }
     cmds += refresh()
     return cmds
