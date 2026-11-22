@@ -111,6 +111,7 @@ struct Relay {
   const char *name;
   uint8_t pin;
   ZigbeePowerOutlet *ep;
+  bool on;  // current state; written only by the safety task, through setRelay()
 };
 
 Relay relays[] = {
@@ -119,15 +120,50 @@ Relay relays[] = {
   {"Heater",    D7, &zbRelay3},  // endpoint 16
 };
 
+enum : uint8_t { BIG_PUMP, CIRC_PUMP, HEATER };  // indices into relays[], same order
+
+// Purge: if the big pump hasn't run for 4 h, run it for 30 s with the heater off,
+// to keep it from sticking. The heater is left off afterwards. Any command from
+// Hubitat ends a purge: the big pump goes off, and the command runs 1 s later.
+const uint32_t PURGE_IDLE_MS = 4UL * 60 * 60 * 1000;
+const uint32_t PURGE_GAP_MS  = 2000;   // heater off -> big pump on
+const uint32_t PURGE_RUN_MS  = 30000;
+
 // Relay commands from Hubitat, passed from the Zigbee task to the safety task,
 // which is the only task that switches relays.
 struct RelayCmd { uint8_t relay; bool on; };
 QueueHandle_t cmdQ;
 TaskHandle_t safetyTask = NULL;
 
+// Switch relay r and tell Hubitat. Only the safety task calls this, both for
+// Hubitat's commands and for the board's own changes (purge, safety checks).
+// It sets the endpoint's On/Off attribute itself and always sends an explicit
+// report, because the library doesn't report the board's own changes (seen in
+// testing). The report goes straight to the hub (coordinator 0x0000, endpoint 1),
+// so it doesn't depend on bindings.
 static void setRelay(uint8_t r, bool on) {
   digitalWrite(relays[r].pin, on ? HIGH : LOW);
+  relays[r].on = on;
   Serial.printf("%s (endpoint %u) %s\r\n", relays[r].name, 14 + r, on ? "on" : "off");
+
+  // Keep the endpoint's On/Off attribute in step with the relay, and tell Hubitat:
+  // send an On/Off command for the new state from this relay's endpoint to the hub
+  // (coordinator 0x0000, endpoint 1), the way a Zigbee wall switch would. The
+  // driver turns it into the child's switch event. (Attribute reports for On/Off
+  // never reach the hub from this stack.)
+  esp_zb_zcl_on_off_cmd_t cmd;
+  memset(&cmd, 0, sizeof(cmd));
+  cmd.zcl_basic_cmd.src_endpoint = 14 + r;
+  cmd.zcl_basic_cmd.dst_endpoint = 1;
+  cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+  cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+  cmd.on_off_cmd_id = on ? ESP_ZB_ZCL_CMD_ON_OFF_ON_ID : ESP_ZB_ZCL_CMD_ON_OFF_OFF_ID;
+
+  esp_zb_lock_acquire(portMAX_DELAY);
+  esp_zb_zcl_set_attribute_val(14 + r, ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                               ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &on, false);
+  esp_zb_zcl_on_off_cmd_req(&cmd);
+  esp_zb_lock_release();
 }
 
 #define OLED_ADDR 0x3C
@@ -142,32 +178,78 @@ static bool assigned(uint64_t addr) {
   return false;
 }
 
-// Safety checks. Runs in its own task, started before the Zigbee wait in
-// setup(), so it keeps running when the hub is unreachable.
+// Safety checks. Runs in its own task, started before the Zigbee wait in setup(),
+// so it keeps running when the hub is unreachable. It is the only task that
+// switches relays: Hubitat's commands reach it through cmdQ, and every change
+// goes through setRelay(), which also reports it to Hubitat.
 static void safety_task(void *arg) {
   // Subscribe to the task watchdog. The core's sdkconfig sets a 5 s timeout and a
   // panic on expiry, so if this task stops feeding it, the board resets and the
   // relays fail off.
-
   if (esp_task_wdt_add(NULL) != ESP_OK) {
     Serial.println("safety: could not subscribe to the task watchdog");
   }
+
+  enum { PURGE_IDLE, PURGE_GAP, PURGE_RUN } purge = PURGE_IDLE;
+  uint32_t purgeAt = 0;             // when the current purge step started
+  uint32_t pumpLastOn = millis();   // last time the big pump was seen running
   uint32_t lastDump = 0;
+
   for (;;) {
     esp_task_wdt_reset();
 
+    // Commands from Hubitat. Waiting here (at most 1 s) instead of sleeping means
+    // a command is applied as soon as it arrives.
     RelayCmd c;
     if (xQueueReceive(cmdQ, &c, pdMS_TO_TICKS(1000)) == pdTRUE) {
-      setRelay(c.relay, c.on);  // Hubitat's command; the purge will hook in here
+      if (purge != PURGE_IDLE) {
+        Serial.println("purge: ended by a command");
+        if (purge == PURGE_RUN) {
+          setRelay(BIG_PUMP, false);
+          delay(1000);  // let the pump stop before running the command
+        }
+        purge = PURGE_IDLE;
+      }
+      setRelay(c.relay, c.on);
     }
 
-    if (millis() - lastDump >= 5000) {
-      lastDump = millis();
+    uint32_t now = millis();
+    if (relays[BIG_PUMP].on) pumpLastOn = now;
+
+    // Purge steps
+    switch (purge) {
+      case PURGE_IDLE:
+        if (now - pumpLastOn >= PURGE_IDLE_MS) {
+          Serial.println("purge: heater off");
+          setRelay(HEATER, false);
+          purge = PURGE_GAP;
+          purgeAt = now;
+        }
+        break;
+      case PURGE_GAP:
+        if (now - purgeAt >= PURGE_GAP_MS) {
+          Serial.println("purge: big pump on");
+          setRelay(BIG_PUMP, true);
+          purge = PURGE_RUN;
+          purgeAt = now;
+        }
+        break;
+      case PURGE_RUN:
+        if (now - purgeAt >= PURGE_RUN_MS) {
+          Serial.println("purge: big pump off");
+          setRelay(BIG_PUMP, false);
+          purge = PURGE_IDLE;
+        }
+        break;
+    }
+
+    if (now - lastDump >= 5000) {
+      lastDump = now;
       Snapshot s;
       if (xQueuePeek(snapQ, &s, 0) == pdTRUE) {
         for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
           Serial.printf("snap %s: %s %.2f°C, %lu ms old\r\n", probes[p].label,
-                        s.ok[p] ? "ok " : "bad", s.temp[p], (unsigned long)(millis() - s.at[p]));
+                        s.ok[p] ? "ok " : "bad", s.temp[p], (unsigned long)(now - s.at[p]));
         }
       } else {
         Serial.println("snap: no data yet");

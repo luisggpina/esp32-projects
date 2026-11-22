@@ -137,6 +137,13 @@ void parse(String description) {
     Map d = zigbee.parseDescriptionAsMap(description)
     if (logEnable) log.debug "parse: ${d}"
 
+    // On/Off commands the board sends whenever a relay changes (see setRelay() in
+    // hot-tub.ino): command 01 = on, 00 = off, from the relay's endpoint.
+    if (d?.clusterInt == 0x0006 && d?.isClusterSpecific && d?.command in ["00", "01"]) {
+        handleSwitch(Integer.parseInt(d.sourceEndpoint, 16), d.command)
+        return
+    }
+
     String epHex = d?.endpoint ?: d?.sourceEndpoint
     if (!epHex || d?.attrInt != 0x0000 || !d?.value) {
         return
