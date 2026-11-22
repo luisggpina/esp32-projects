@@ -115,6 +115,10 @@ struct Snapshot {
 };
 QueueHandle_t snapQ;
 
+// Set to make the sensor task run probe setup: at boot with no stored mapping,
+// when a new probe appears on the bus, or after 5 screen toggles within 60 s.
+std::atomic<bool> setupRequested{false};
+
 // One Temperature Measurement endpoint per probe: probes[i] -> endpoint 10 + i
 ZigbeeTempSensor zbTemp1 = ZigbeeTempSensor(10);
 ZigbeeTempSensor zbTemp2 = ZigbeeTempSensor(11);
@@ -226,6 +230,9 @@ static void safety_task(void *arg) {
   uint32_t pumpLastOn = millis();   // last time the big pump was seen running
   uint32_t lastDump = 0;
 
+  uint32_t toggles[5] = {};         // times of the last 5 screen changes from Hubitat
+  uint8_t toggleNext = 0, toggleCount = 0;
+
   for (;;) {
     esp_task_wdt_reset();
 
@@ -239,6 +246,7 @@ static void safety_task(void *arg) {
     }
     wasConnected = connected;
 
+
     // Commands from Hubitat. Waiting here (at most 1 s) instead of sleeping means
     // a command is applied as soon as it arrives.
     RelayCmd c;
@@ -250,6 +258,18 @@ static void safety_task(void *arg) {
           delay(1000);  // let the pump stop before running the command
         }
         purge = PURGE_IDLE;
+      }
+      // 5 "on" commands for the screen from Hubitat within 60 s: run probe setup
+      if (c.relay == SCREEN && c.on) {
+        uint32_t t = millis();
+        toggles[toggleNext] = t;
+        toggleNext = (toggleNext + 1) % 5;
+        if (toggleCount < 5) toggleCount++;
+        if (toggleCount == 5 && t - toggles[toggleNext] <= 60000) {
+          Serial.println("Screen on 5 times in 60 s: probe setup requested");
+          setupRequested = true;
+          toggleCount = 0;
+        }
       }
       setRelay(c.relay, c.on);
     }
@@ -323,6 +343,24 @@ static void saveProbes() {
   prefs.end();
 }
 
+// True if a probe on the bus isn't in the mapping. A missing probe doesn't count:
+// it reads as bad, and the safety checks handle that.
+static bool newProbeOnBus(OneWire32 &ds) {
+  uint64_t found[8];
+  uint8_t n = ds.search(found, sizeof(found)/sizeof(*found));
+  for (uint8_t i = 0; i < n; i++) {
+    bool known = false;
+    for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+      if (probes[p].addr == found[i]) known = true;
+    }
+    if (!known) {
+      Serial.printf("New probe 0x%llx on the bus: starting probe setup\r\n", found[i]);
+      return true;
+    }
+  }
+  return false;
+}
+
 // Read the mapped probes, update and publish the snapshot, report to Zigbee.
 // The caller starts the conversion (ds.request() and the 750 ms wait).
 static void readProbes(OneWire32 &ds, Snapshot &s) {
@@ -342,7 +380,6 @@ static void readProbes(OneWire32 &ds, Snapshot &s) {
 }
 
 static void temp_sensor_value_update(void *arg) {
-  { Preferences prefs; prefs.begin("probes", false); prefs.clear(); prefs.end(); }  // TEMPORARY: forget the mapping
   loadProbes();
 
   OneWire32 ds(D2);
@@ -353,25 +390,35 @@ static void temp_sensor_value_update(void *arg) {
     Serial.printf("  %u: 0x%llx\r\n", i, addr[i]);
   }
 
-  Snapshot s = {};
-  bool screenOn = true;
-
   // No stored mapping (first boot, or after clearing it): ask which probe is which.
   bool empty = true;
   for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
     if (probes[p].addr != 0) empty = false;
   }
-  if (empty) {
-    if (displayOk) display.oled_command(SH110X_DISPLAYON);  // show the prompts
-    setupProbes(ds, s);
-    screenOn = true;  // the loop below re-applies the screen switch from Hubitat
-  }
+  if (empty) setupRequested = true;
 
-  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
-    Serial.printf("Probe %s -> endpoint %u -> 0x%llx\r\n", probes[p].label, 10 + p, probes[p].addr);
-  }
+  Snapshot s = {};
+  bool screenOn = true;
+  uint32_t lastSearch = millis();
 
   for (;;) {
+    // Probe setup: requested (boot, screen toggles), or a new probe on the bus,
+    // checked once a minute.
+    bool needSetup = setupRequested.exchange(false);
+    if (!needSetup && millis() - lastSearch >= 60000) {
+      lastSearch = millis();
+      needSetup = newProbeOnBus(ds);
+    }
+    if (needSetup) {
+      if (displayOk) display.oled_command(SH110X_DISPLAYON);  // show the prompts
+      setupProbes(ds, s);
+      screenOn = true;  // below, the screen switch from Hubitat is applied again
+      for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+        Serial.printf("Probe %s -> endpoint %u -> 0x%llx\r\n", probes[p].label, 10 + p, probes[p].addr);
+      }
+      lastSearch = millis();
+    }
+
     ds.request();                    // start conversion on all sensors
     delay(750);
 
