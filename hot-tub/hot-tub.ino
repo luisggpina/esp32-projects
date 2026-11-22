@@ -67,6 +67,27 @@ Probe probes[] = {
   {"4", 0x0},
 };
 
+// Latest probe readings, shared between tasks.
+//
+// snapQ is a FreeRTOS queue of length 1 used as an atomic register (FreeRTOS calls
+// this a "mailbox"): the sensor task is the only writer, any task may read.
+//   - Write: xQueueOverwrite() replaces the single slot; it never blocks and never
+//     queues up old values. Only valid on a queue of length 1.
+//   - Read:  xQueuePeek() copies the slot out without removing it, so every reader
+//     sees the latest snapshot.
+// Both copy the whole struct inside the queue's critical section, so a reader gets
+// either the old snapshot or the new one, never a mix of the two.
+// Until the first write, xQueuePeek() fails: treat that as "no data", i.e. every
+// probe is bad. The queue's memory is allocated once, in setup(), and never grows.
+// Do not call these from an ISR (the ...FromISR variants exist for that).
+struct Snapshot {
+  float    temp[sizeof(probes) / sizeof(*probes)];  // °C, last good read
+  bool     ok[sizeof(probes) / sizeof(*probes)];    // did the last read succeed?
+  uint32_t at[sizeof(probes) / sizeof(*probes)];    // millis() of last good read;
+                                                    // age = millis() - at, wrap-safe
+};
+QueueHandle_t snapQ;
+
 // One Temperature Measurement endpoint per probe: probes[i] -> endpoint 10 + i
 ZigbeeTempSensor zbTemp1 = ZigbeeTempSensor(10);
 ZigbeeTempSensor zbTemp2 = ZigbeeTempSensor(11);
@@ -130,21 +151,25 @@ static void temp_sensor_value_update(void *arg) {
     Serial.printf("Probe %s -> endpoint %u -> 0x%llx\r\n", probes[p].label, 10 + p, probes[p].addr);
   }
 
+  Snapshot s = {};
   for (;;) {
     ds.request();                    // start conversion on all sensors
     delay(750);
 
-    float temps[(sizeof(probes)/sizeof(*probes))];
-    bool ok[(sizeof(probes)/sizeof(*probes))];
     for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
-      ok[p] = probes[p].addr != 0 && ds.getTemp(probes[p].addr, temps[p]) == 0;
-      if (ok[p]) {
-        Serial.printf("Probe %s: %.2f°C\r\n", probes[p].label, temps[p]);
-        zbTemps[p]->setTemperature(temps[p]);
+      float t;
+      s.ok[p] = probes[p].addr != 0 && ds.getTemp(probes[p].addr, t) == 0;
+      if (s.ok[p]) {
+        s.temp[p] = t;
+        s.at[p] = millis();
+        Serial.printf("Probe %s: %.2f°C\r\n", probes[p].label, t);
+        zbTemps[p]->setTemperature(t);
       } else {
         Serial.printf("Probe %s: read error\r\n", probes[p].label);
       }
     }
+
+    xQueueOverwrite(snapQ, &s);  // publish this cycle's snapshot to all readers
 
     if (displayOk) {
       display.clearDisplay();
@@ -152,7 +177,7 @@ static void temp_sensor_value_update(void *arg) {
       display.setTextSize(2);
       for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
         display.setCursor(0, p * 16);
-        if (ok[p]) display.printf("%s %.1fF", probes[p].label, temps[p] * 9.0 / 5.0 + 32.0);
+        if (s.ok[p]) display.printf("%s %.1fF", probes[p].label, s.temp[p] * 9.0 / 5.0 + 32.0);
         else       display.printf("%s --", probes[p].label);
       }
       display.display();
@@ -213,8 +238,11 @@ void setup() {
     Serial.println("Zigbee started successfully!");
   }
 
-  // Start Temperature sensor reading task
+  // One-slot mailbox for Snapshot; see the comment at struct Snapshot.
+  snapQ = xQueueCreate(1, sizeof(Snapshot));
+  if (!snapQ) { Serial.println("snapshot queue alloc failed"); ESP.restart(); }
 
+  // Start Temperature sensor reading task
   xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
 
   Serial.println("Connecting to network");
@@ -235,6 +263,21 @@ void setup() {
 }
 
 void loop() {
+  static uint32_t lastDump = 0;
+  if (millis() - lastDump > 5000) {
+    lastDump = millis();
+    Snapshot s;
+    if (xQueuePeek(snapQ, &s, 0) == pdTRUE) {  // copy of the latest snapshot
+      for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+        Serial.printf("snap %s: %s %.2f°C, %lu ms old\r\n", probes[p].label,
+                      s.ok[p] ? "ok " : "bad", s.temp[p], (unsigned long)(millis() - s.at[p]));
+      }
+    } else {
+      // nothing published yet: treat every probe as bad
+      Serial.println("snap: no data yet");
+    }
+  }
+
   // Checking button for factory reset
   if (digitalRead(button) == LOW) {  // Push button pressed
     // Key debounce handling
