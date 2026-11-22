@@ -2,14 +2,22 @@
  * ESP32-C6 hot tub controller (parent driver)
  *
  * For the hot-tub sketch, which exposes:
- *   - endpoints 0x0A-0x0D: Temperature Measurement (0x0402), one per DS18B20 probe
- *   - endpoints 0x0E-0x10: On/Off (0x0006) for the big pump, circulation pump and heater
+ *   - Temperature Measurement (0x0402), one endpoint per probe role:
+ *       0x0A outside, 0x0B water top, 0x0C water bottom, 0x0D heater outlet
+ *   - On/Off (0x0006), one endpoint per output:
+ *       0x0E big pump, 0x0F circulation pump, 0x10 heater, 0x11 screen
  *
  * Creates one child per endpoint, using Hubitat's built-in "Generic Component
  * Temperature Sensor" and "Generic Component Switch" drivers, and routes each
- * endpoint's reports to its child. RELAY_NAMES must list the loads in the same
- * order as relays[] in hot-tub.ino. Child labels are only set when a child is
- * created; use Reset Child Names to apply RELAY_NAMES to existing children.
+ * endpoint's reports to its child. PROBE_NAMES and RELAY_NAMES must list the
+ * roles and outputs in the same order as probes[] and relays[] in hot-tub.ino.
+ * Child labels are only set when a child is created; use Reset Child Names to
+ * apply the names to existing children.
+ *
+ * The board doesn't send attribute reports for On/Off. Instead, whenever an
+ * output changes (a command from here, a purge, a safety check, or rejoining),
+ * it sends an On/Off command from that output's endpoint to the hub, and parse()
+ * turns it into the child's switch event.
  */
 
 import hubitat.zigbee.zcl.DataType
@@ -29,6 +37,7 @@ metadata {
 @groovy.transform.Field static final List<Integer> ENDPOINTS = [0x0A, 0x0B, 0x0C, 0x0D]
 @groovy.transform.Field static final List<Integer> RELAY_ENDPOINTS = [0x0E, 0x0F, 0x10, 0x11]
 @groovy.transform.Field static final List<String> RELAY_NAMES = ["big pump", "circ pump", "heater", "screen"]
+@groovy.transform.Field static final List<String> PROBE_NAMES = ["outside", "water top", "water bottom", "heater outlet"]
 
 void installed() {
     createChildren()
@@ -46,7 +55,7 @@ void createChildren() {
     ENDPOINTS.eachWithIndex { Integer ep, int i ->
         String dni = childDni(ep)
         if (!getChildDevice(dni)) {
-            String label = "${device.displayName} probe ${i + 1}"
+            String label = "${device.displayName} ${PROBE_NAMES[i]}"
             addChildDevice("hubitat", "Generic Component Temperature Sensor", dni,
                            [name: label, label: label, isComponent: false])
         }
@@ -62,6 +71,9 @@ void createChildren() {
 }
 
 void resetChildNames() {
+    ENDPOINTS.eachWithIndex { Integer ep, int i ->
+        getChildDevice(childDni(ep))?.setLabel("${device.displayName} ${PROBE_NAMES[i]}")
+    }
     RELAY_ENDPOINTS.eachWithIndex { Integer ep, int i ->
         getChildDevice(childDni(ep))?.setLabel("${device.displayName} ${RELAY_NAMES[i]}")
     }

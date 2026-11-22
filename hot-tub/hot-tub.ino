@@ -52,6 +52,8 @@
 #include <esp_task_wdt.h>
 #include <atomic>
 
+#include <Preferences.h>
+
 /* Zigbee temperature sensor configuration */
 uint8_t button = BOOT_PIN;
 
@@ -63,11 +65,33 @@ struct Probe {
   uint64_t addr;      // DS18B20 64-bit ROM address
 };
 
+// Probe roles, in setup order; probes[i] reports on endpoint 10 + i. The heater
+// probe is whichever one is left after the other three are assigned.
 Probe probes[] = {
-  {"1", 0x0},
-  {"2", 0x0},
-  {"3", 0x0},
-  {"4", 0x0},
+  {"Outside", 0x0},
+  {"Top",     0x0},
+  {"Bottom",  0x0},
+  {"Heater",  0x0},
+};
+enum : uint8_t { P_OUTSIDE, P_TOP, P_BOTTOM, P_HEATER };  // indices into probes[]
+
+const float    SETUP_DELTA_C   = 2.0 / 1.8;  // 5 °F: a change this big picks the probe
+const uint32_t SETUP_UNPLUG_MS = 5000;       // no good read this long = unplugged
+
+// Probe setup: ask for each role in turn (outside, water top, water bottom). The
+// first unassigned probe that changes by more than 5 °F, or stops answering for 5 s
+// and then answers again, gets that role. The heater is the probe left over. The bus
+// is searched again on every cycle, because a single search sometimes misses probes,
+// and every probe ever found is kept. The current mapping keeps being read and
+// published meanwhile, and the new one is only used, and saved, at the end.
+struct Candidate {
+  uint64_t addr;
+  bool taken;      // already given a role
+  bool haveBase;   // have a reading since this role's prompt
+  bool wasGone;    // stopped answering for SETUP_UNPLUG_MS since the prompt
+  float base;      // reading when this role's prompt appeared
+  uint32_t lastOk; // millis() of the last good read
+  const char *role; // role name once assigned (for the screen), else nullptr
 };
 
 // Latest probe readings, shared between tasks.
@@ -275,7 +299,52 @@ static void safety_task(void *arg) {
   }
 }
 
+// The role -> probe address mapping, kept in flash (NVS) across reboots and uploads.
+static void loadProbes() {
+  Preferences prefs;
+  prefs.begin("probes", true);
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    char key[4];
+    snprintf(key, sizeof(key), "p%u", p);
+    probes[p].addr = prefs.getULong64(key, 0);
+    Serial.printf("Stored %s -> 0x%llx\r\n", probes[p].label, probes[p].addr);
+  }
+  prefs.end();
+}
+
+static void saveProbes() {
+  Preferences prefs;
+  prefs.begin("probes", false);
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    char key[4];
+    snprintf(key, sizeof(key), "p%u", p);
+    prefs.putULong64(key, probes[p].addr);
+  }
+  prefs.end();
+}
+
+// Read the mapped probes, update and publish the snapshot, report to Zigbee.
+// The caller starts the conversion (ds.request() and the 750 ms wait).
+static void readProbes(OneWire32 &ds, Snapshot &s) {
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    float t;
+    s.ok[p] = probes[p].addr != 0 && ds.getTemp(probes[p].addr, t) == 0;
+    if (s.ok[p]) {
+      s.temp[p] = t;
+      s.at[p] = millis();
+      Serial.printf("Probe %s: %.2f°C\r\n", probes[p].label, t);
+      zbTemps[p]->setTemperature(t);
+    } else {
+      Serial.printf("Probe %s: read error\r\n", probes[p].label);
+    }
+  }
+  xQueueOverwrite(snapQ, &s);  // publish this cycle's snapshot to all readers
+}
+
 static void temp_sensor_value_update(void *arg) {
+  { Preferences prefs; prefs.begin("probes", false); prefs.clear(); prefs.end(); }  // TEMPORARY: forget the mapping
+  loadProbes();
+
   OneWire32 ds(D2);
   uint64_t addr[(sizeof(probes)/sizeof(*probes))];
   uint8_t found = ds.search(addr, (sizeof(probes)/sizeof(*probes)));
@@ -284,34 +353,29 @@ static void temp_sensor_value_update(void *arg) {
     Serial.printf("  %u: 0x%llx\r\n", i, addr[i]);
   }
 
-  // Fill table entries left at 0 with sensors not already in the table
+  Snapshot s = {};
+  bool screenOn = true;
+
+  // No stored mapping (first boot, or after clearing it): ask which probe is which.
+  bool empty = true;
   for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
-    for (uint8_t i = 0; probes[p].addr == 0 && i < found; i++) {
-      if (!assigned(addr[i])) probes[p].addr = addr[i];
-    }
+    if (probes[p].addr != 0) empty = false;
+  }
+  if (empty) {
+    if (displayOk) display.oled_command(SH110X_DISPLAYON);  // show the prompts
+    setupProbes(ds, s);
+    screenOn = true;  // the loop below re-applies the screen switch from Hubitat
+  }
+
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
     Serial.printf("Probe %s -> endpoint %u -> 0x%llx\r\n", probes[p].label, 10 + p, probes[p].addr);
   }
 
-  Snapshot s = {};
-  bool screenOn = true;
   for (;;) {
     ds.request();                    // start conversion on all sensors
     delay(750);
 
-    for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
-      float t;
-      s.ok[p] = probes[p].addr != 0 && ds.getTemp(probes[p].addr, t) == 0;
-      if (s.ok[p]) {
-        s.temp[p] = t;
-        s.at[p] = millis();
-        Serial.printf("Probe %s: %.2f°C\r\n", probes[p].label, t);
-        zbTemps[p]->setTemperature(t);
-      } else {
-        Serial.printf("Probe %s: read error\r\n", probes[p].label);
-      }
-    }
-
-    xQueueOverwrite(snapQ, &s);  // publish this cycle's snapshot to all readers
+    readProbes(ds, s);
 
     // The screen's state is set by the safety task (from Hubitat); only this task
     // talks to the OLED, so the panel is switched here.
@@ -332,6 +396,135 @@ static void temp_sensor_value_update(void *arg) {
     }
     delay(1000);
   }
+}
+
+// The setup screen: the prompt, then one line per probe found so far (up to 5):
+// the last four hex digits of its serial number, its temperature, and its role once
+// assigned.
+static void showSetup(const char *label, const Candidate *c, const float *t, const bool *ok, uint8_t n) {
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Warm, cool or unplug:");
+  display.setTextSize(2);
+  display.setCursor(0, 8);
+  display.print(label);
+  display.setTextSize(1);
+  for (uint8_t i = 0; i < n && i < 5; i++) {
+    display.setCursor(0, 24 + i * 8);
+    unsigned id = (c[i].addr >> 8) & 0xFFFF;
+    const char *role = c[i].role ? c[i].role : "";
+    if (ok[i]) display.printf("%04X %5.1fF %s", id, t[i] * 1.8 + 32.0, role);
+    else       display.printf("%04X   --   %s", id, role);
+  }
+  display.display();
+}
+
+static void showPrompt(const char *label) {
+  Serial.printf("Probe setup: warm, cool or unplug the %s probe\r\n", label);
+  if (!displayOk) return;
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Probe setup");
+  display.println();
+  display.println("Warm, cool or unplug:");
+  display.setTextSize(2);
+  display.println(label);
+  display.display();
+}
+
+// Search the bus once and add any new probes to c[]; returns the new count.
+static uint8_t searchMore(OneWire32 &ds, Candidate *c, uint8_t n, uint8_t max) {
+  uint64_t batch[8];
+  uint8_t m = ds.search(batch, sizeof(batch)/sizeof(*batch));
+  for (uint8_t j = 0; j < m; j++) {
+    bool seen = false;
+    for (uint8_t i = 0; i < n; i++) if (c[i].addr == batch[j]) seen = true;
+    if (!seen && n < max) {
+      c[n] = {batch[j], false, false, false, 0.0f, millis()};
+      Serial.printf("Probe setup: found 0x%llx\r\n", batch[j]);
+      n++;
+    }
+  }
+  return n;
+}
+
+static void setupProbes(OneWire32 &ds, Snapshot &s) {
+  Candidate c[8];
+  const uint8_t max = sizeof(c)/sizeof(*c);
+  uint8_t n = 0;
+  uint64_t assigned[sizeof(probes)/sizeof(*probes)] = {};
+  float temps[sizeof(c)/sizeof(*c)];
+  bool oks[sizeof(c)/sizeof(*c)];
+
+  for (uint8_t role = 0; role < P_HEATER; role++) {
+    for (uint8_t i = 0; i < n; i++) {
+      c[i].haveBase = false;
+      c[i].wasGone = false;
+      c[i].lastOk = millis();
+    }
+
+    showPrompt(probes[role].label);
+    bool done = false;
+    while (!done) {
+      n = searchMore(ds, c, n, max);
+
+      ds.request();
+      delay(750);
+      readProbes(ds, s);
+
+      Serial.printf("Probe setup (%s):\r\n", probes[role].label);
+      for (uint8_t i = 0; i < n; i++) {
+        float t;
+        bool ok = ds.getTemp(c[i].addr, t) == 0;
+        oks[i] = ok;
+        temps[i] = t;
+        if (ok) {
+          Serial.printf("  0x%016llx  %6.2f°C  %6.1f°F%s\r\n", c[i].addr, t, t * 1.8 + 32.0,
+                        c[i].taken ? "  (assigned)" : "");
+        } else {
+          Serial.printf("  0x%016llx  --%s\r\n", c[i].addr, c[i].taken ? "  (assigned)" : "");
+        }
+
+        if (c[i].taken || done) continue;
+        if (ok) {
+          if (c[i].wasGone || (c[i].haveBase && fabsf(t - c[i].base) > SETUP_DELTA_C)) {
+            assigned[role] = c[i].addr;
+            c[i].taken = true;
+            done = true;
+            Serial.printf("Probe setup: %s -> 0x%llx\r\n", probes[role].label, c[i].addr);
+          } else if (!c[i].haveBase) {
+            c[i].base = t;
+            c[i].haveBase = true;
+          }
+          c[i].lastOk = millis();
+        } else if (millis() - c[i].lastOk >= SETUP_UNPLUG_MS) {
+          c[i].wasGone = true;
+        }
+      }
+
+      showSetup(probes[role].label, c, temps, oks, n);
+    }
+  }
+
+  // A few more searches, so a heater probe the earlier ones missed still counts
+  for (uint8_t k = 0; k < 3; k++) n = searchMore(ds, c, n, max);
+  for (uint8_t i = 0; i < n; i++) {
+    if (!c[i].taken) {
+      assigned[P_HEATER] = c[i].addr;
+      Serial.printf("Probe setup: %s -> 0x%llx\r\n", probes[P_HEATER].label, c[i].addr);
+      break;
+    }
+  }
+
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    probes[p].addr = assigned[p];
+  }
+  saveProbes();
 }
 
 /********************* Arduino functions **************************/
