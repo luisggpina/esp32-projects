@@ -27,8 +27,8 @@ metadata {
 }
 
 @groovy.transform.Field static final List<Integer> ENDPOINTS = [0x0A, 0x0B, 0x0C, 0x0D]
-@groovy.transform.Field static final List<Integer> RELAY_ENDPOINTS = [0x0E, 0x0F, 0x10]
-@groovy.transform.Field static final List<String> RELAY_NAMES = ["big pump", "circ pump", "heater"]
+@groovy.transform.Field static final List<Integer> RELAY_ENDPOINTS = [0x0E, 0x0F, 0x10, 0x11]
+@groovy.transform.Field static final List<String> RELAY_NAMES = ["big pump", "circ pump", "heater", "screen"]
 
 void installed() {
     createChildren()

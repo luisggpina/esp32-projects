@@ -50,6 +50,7 @@
 #include <OneWireESP32.h>
 
 #include <esp_task_wdt.h>
+#include <atomic>
 
 /* Zigbee temperature sensor configuration */
 uint8_t button = BOOT_PIN;
@@ -106,21 +107,25 @@ static_assert(sizeof(zbTemps) / sizeof(*zbTemps) == sizeof(probes) / sizeof(*pro
 ZigbeePowerOutlet zbRelay1 = ZigbeePowerOutlet(14);
 ZigbeePowerOutlet zbRelay2 = ZigbeePowerOutlet(15);
 ZigbeePowerOutlet zbRelay3 = ZigbeePowerOutlet(16);
+ZigbeePowerOutlet zbRelay4 = ZigbeePowerOutlet(17);  // screen on/off
 
 struct Relay {
   const char *name;
   uint8_t pin;
   ZigbeePowerOutlet *ep;
-  bool on;  // current state; written only by the safety task, through setRelay()
+  std::atomic<bool> on;  // current state; written only by the safety task, through setRelay()
 };
+
+const uint8_t NO_PIN = 0xFF;  // an output with no GPIO (the screen)
 
 Relay relays[] = {
   {"Big pump",  D9, &zbRelay1},  // endpoint 14
   {"Circ pump", D8, &zbRelay2},  // endpoint 15
   {"Heater",    D7, &zbRelay3},  // endpoint 16
+  {"Screen", NO_PIN, &zbRelay4, true},   // endpoint 17; starts on
 };
 
-enum : uint8_t { BIG_PUMP, CIRC_PUMP, HEATER };  // indices into relays[], same order
+enum : uint8_t { BIG_PUMP, CIRC_PUMP, HEATER, SCREEN };  // indices into relays[], same order
 
 // Purge: if the big pump hasn't run for 4 h, run it for 30 s with the heater off,
 // to keep it from sticking. The heater is left off afterwards. Any command from
@@ -144,7 +149,7 @@ TaskHandle_t safetyTask = NULL;
 // testing). The report goes straight to the hub (coordinator 0x0000, endpoint 1),
 // so it doesn't depend on bindings.
 static void setRelay(uint8_t r, bool on) {
-  digitalWrite(relays[r].pin, on ? HIGH : LOW);
+  if (relays[r].pin != NO_PIN) digitalWrite(relays[r].pin, on ? HIGH : LOW);
   relays[r].on = on;
   Serial.printf("%s (endpoint %u) %s\r\n", relays[r].name, 14 + r, on ? "on" : "off");
 
@@ -214,7 +219,7 @@ static void safety_task(void *arg) {
     // a command is applied as soon as it arrives.
     RelayCmd c;
     if (xQueueReceive(cmdQ, &c, pdMS_TO_TICKS(1000)) == pdTRUE) {
-      if (purge != PURGE_IDLE) {
+      if (purge != PURGE_IDLE && c.relay != SCREEN) {
         Serial.println("purge: ended by a command");
         if (purge == PURGE_RUN) {
           setRelay(BIG_PUMP, false);
@@ -288,6 +293,7 @@ static void temp_sensor_value_update(void *arg) {
   }
 
   Snapshot s = {};
+  bool screenOn = true;
   for (;;) {
     ds.request();                    // start conversion on all sensors
     delay(750);
@@ -307,7 +313,13 @@ static void temp_sensor_value_update(void *arg) {
 
     xQueueOverwrite(snapQ, &s);  // publish this cycle's snapshot to all readers
 
-    if (displayOk) {
+    // The screen's state is set by the safety task (from Hubitat); only this task
+    // talks to the OLED, so the panel is switched here.
+    if (displayOk && relays[SCREEN].on != screenOn) {
+      screenOn = relays[SCREEN].on;
+      display.oled_command(screenOn ? SH110X_DISPLAYON : SH110X_DISPLAYOFF);
+    }
+    if (displayOk && screenOn) {
       display.clearDisplay();
       display.setTextColor(SH110X_WHITE);
       display.setTextSize(2);
@@ -346,6 +358,7 @@ void setup() {
   zbRelay1.onPowerOutletChange([](bool on) { onRelayChange(0, on); });
   zbRelay2.onPowerOutletChange([](bool on) { onRelayChange(1, on); });
   zbRelay3.onPowerOutletChange([](bool on) { onRelayChange(2, on); });
+  zbRelay4.onPowerOutletChange([](bool on) { onRelayChange(3, on); });
 
   for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
     zbTemps[p]->setManufacturerAndModel("Espressif", "ZigbeeTempSensor");
