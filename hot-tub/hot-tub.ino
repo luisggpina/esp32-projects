@@ -129,6 +129,8 @@ const uint32_t PURGE_IDLE_MS = 4UL * 60 * 60 * 1000;
 const uint32_t PURGE_GAP_MS  = 2000;   // heater off -> big pump on
 const uint32_t PURGE_RUN_MS  = 30000;
 
+bool wasConnected = false;        // to spot a (re)join
+
 // Relay commands from Hubitat, passed from the Zigbee task to the safety task,
 // which is the only task that switches relays.
 struct RelayCmd { uint8_t relay; bool on; };
@@ -197,6 +199,16 @@ static void safety_task(void *arg) {
 
   for (;;) {
     esp_task_wdt_reset();
+
+    // Each time the board (re)joins, tell Hubitat the real state of every relay. At
+    // boot they're all off, but Hubitat still shows whatever it knew before.
+    bool connected = Zigbee.connected();
+    if (connected && !wasConnected) {
+      for (uint8_t r = 0; r < (sizeof(relays)/sizeof(*relays)); r++) {
+        setRelay(r, relays[r].on);
+      }
+    }
+    wasConnected = connected;
 
     // Commands from Hubitat. Waiting here (at most 1 s) instead of sleeping means
     // a command is applied as soon as it arrives.
