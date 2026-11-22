@@ -169,6 +169,14 @@ const float    FREEZE_ON_C     = (35.0 - 32.0) / 1.8;
 const float    FREEZE_OFF_C    = (36.0 - 32.0) / 1.8;
 const uint32_t FREEZE_STALE_MS = 5UL * 60 * 1000;
 
+// Over-temperature: at or above 110 °F at the water top, the big pump is turned off
+// (no flow, so the heater stops), and Hubitat can't turn it on again until the top is
+// below 108 °F. After that it stays off until Hubitat turns it on. With no good water
+// top reading for 5 min, assume it's too hot.
+const float    HOT_ON_C     = (110.0 - 32.0) / 1.8;
+const float    HOT_OFF_C    = (108.0 - 32.0) / 1.8;
+const uint32_t HOT_STALE_MS = 5UL * 60 * 1000;
+
 bool wasConnected = false;        // to spot a (re)join
 
 // Relay commands from Hubitat, passed from the Zigbee task to the safety task,
@@ -238,6 +246,7 @@ static void safety_task(void *arg) {
   uint32_t lastDump = 0;
 
   bool freeze = false;              // freeze protection active
+  bool hot = false;                 // over-temperature active
   bool circWanted = false;          // what Hubitat last asked for the circ pump (off at boot)
 
   uint32_t toggles[5] = {};         // times of the last 5 screen changes from Hubitat
@@ -284,7 +293,10 @@ static void safety_task(void *arg) {
       if (c.relay == CIRC_PUMP) circWanted = c.on;
       if (freeze && c.relay == CIRC_PUMP && !c.on) {
         Serial.println("freeze protection: circ pump stays on");
-        setRelay(CIRC_PUMP, true);  // the command already set the attribute to off; put it back and tell Hubitat
+        setRelay(CIRC_PUMP, true);   // put the attribute back and tell Hubitat
+      } else if (hot && c.relay == BIG_PUMP && c.on) {
+        Serial.println("over-temperature: big pump stays off");
+        setRelay(BIG_PUMP, false);   // put the attribute back and tell Hubitat
       } else {
         setRelay(c.relay, c.on);
       }
@@ -335,6 +347,22 @@ static void safety_task(void *arg) {
       if (!freeze) setRelay(CIRC_PUMP, circWanted);  // back to what Hubitat last asked for
     }
     if (freeze && !relays[CIRC_PUMP].on) setRelay(CIRC_PUMP, true);
+
+    // Over-temperature, from the water top probe
+    bool topStale = now - fs.at[P_TOP] >= HOT_STALE_MS;
+    float top = fs.temp[P_TOP];  // last good reading
+    bool wasHot = hot;
+    if (topStale || top >= HOT_ON_C) hot = true;
+    else if (top < HOT_OFF_C)        hot = false;
+    if (hot != wasHot) {
+      Serial.printf("over-temperature %s (%s)\r\n", hot ? "on" : "off",
+                    topStale ? "no water top reading for 5 min" : "water top temperature");
+      if (hot && purge != PURGE_IDLE) {
+        Serial.println("purge: ended by over-temperature");
+        purge = PURGE_IDLE;
+      }
+    }
+    if (hot && relays[BIG_PUMP].on) setRelay(BIG_PUMP, false);
 
     if (now - lastDump >= 5000) {
       lastDump = now;
