@@ -211,6 +211,8 @@ static void setRelay(uint8_t r, bool on) {
   relays[r].on = on;
   log_i("%s (endpoint %u) %s", relays[r].name, 14 + r, on ? "on" : "off");
 
+  if (!Zigbee.connected()) return;  // not joined yet: the join announcement will tell the hub
+
   // Keep the endpoint's On/Off attribute in step with the relay, and tell Hubitat:
   // send an On/Off command for the new state from this relay's endpoint to the hub
   // (coordinator 0x0000, endpoint 1), the way a Zigbee wall switch would. The
@@ -838,16 +840,26 @@ void setup() {
   oledMutex = xSemaphoreCreateMutex();
   if (displayOk) xTaskCreate(display_task, "display", 4096, NULL, 5, NULL);
 
-  // Start Temperature sensor reading task
-  xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
-
-  xTaskCreate(safety_task, "safety", 4096, NULL, 11, &safetyTask);
+  // A new board (never joined, or after a factory reset) waits for the join before
+  // starting the tasks, so nothing touches the stack while it's being commissioned.
+  // A board that has joined before starts them right away, so the safety checks run
+  // even if the hub is down.
+  bool firstJoin = esp_zb_bdb_is_factory_new();
+  if (!firstJoin) {
+    xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
+    xTaskCreate(safety_task, "safety", 4096, NULL, 11, &safetyTask);
+  }
 
   log_i("Connecting to network");
   while (!Zigbee.connected()) {
     delay(100);
   }
   log_i("Connected to network");
+
+  if (firstJoin) {
+    xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
+    xTaskCreate(safety_task, "safety", 4096, NULL, 11, &safetyTask);
+  }
 
   // Set reporting interval for temperature measurement in seconds, must be called after Zigbee.begin()
   // min_interval and max_interval in seconds, delta in °C
