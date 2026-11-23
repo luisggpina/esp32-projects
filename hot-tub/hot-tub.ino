@@ -127,6 +127,12 @@ std::atomic<bool> setupRequested{false};
 std::atomic<bool> freezeActive{false};
 std::atomic<bool> hotActive{false};
 
+// The display task draws the status screen and owns the panel's power; the sensor
+// task draws the setup screens. oledMutex keeps them from using the OLED at the
+// same time, and setupActive tells the display task to leave the screen alone.
+SemaphoreHandle_t oledMutex;
+std::atomic<bool> setupActive{false};
+
 // One Temperature Measurement endpoint per probe: probes[i] -> endpoint 10 + i
 ZigbeeTempSensor zbTemp1 = ZigbeeTempSensor(10);
 ZigbeeTempSensor zbTemp2 = ZigbeeTempSensor(11);
@@ -251,22 +257,35 @@ static void tile(uint8_t y, bool on) {
   else      u8g2.drawRFrame(98, y + 1, 30, 14, 2);
 }
 
+// n lines through (cx, cy), r pixels each way, evenly spaced from angle a: 2n spokes.
+// Used for the impeller (n = 2) and the snowflake (n = 3).
+static void spokes(uint8_t cx, uint8_t cy, uint8_t r, uint8_t n, float a) {
+  for (uint8_t k = 0; k < n; k++) {
+    float u = a + k * (float)M_PI / n;
+    int dx = lroundf(r * cosf(u)), dy = lroundf(r * sinf(u));
+    u8g2.drawLine(cx - dx, cy - dy, cx + dx, cy + dy);
+  }
+}
+
 // The status screen. Left: the tub, with the water top temperature large near the
 // surface and the bottom temperature on the floor. Right, top to bottom: outside,
 // circulation pump (a snowflake during freeze protection), big pump, heater with
-// its outlet temperature.
-static void drawStatus(const Snapshot &s) {
+// its outlet temperature. Everything that moves advances one step per frame (the
+// display task draws 4 frames a second), and only while what it shows is running.
+static void drawStatus(const Snapshot &s, uint32_t frame) {
   char buf[12];
   u8g2.clearBuffer();
   u8g2.setDrawColor(1);
 
-  // Tub, open at the top, with the water surface
+  // Tub, open at the top, with the water surface: a zigzag that drifts left while
+  // either pump moves the water
   u8g2.drawVLine(0, 2, 62);
   u8g2.drawVLine(95, 2, 62);
   u8g2.drawHLine(0, 63, 96);
-  for (uint8_t x = 2; x + 4 <= 94; x += 4) {
-    u8g2.drawLine(x, 5, x + 2, 3);
-    u8g2.drawLine(x + 2, 3, x + 4, 5);
+  uint32_t drift = (relays[BIG_PUMP].on || relays[CIRC_PUMP].on) ? frame : 0;
+  for (uint8_t x = 2; x <= 94; x++) {
+    int t = (x + 2 + drift) % 4;
+    u8g2.drawPixel(x, 3 + abs(t - 2));
   }
 
   // Water top: whole degrees large, the tenth small, right-aligned so the
@@ -302,27 +321,29 @@ static void drawStatus(const Snapshot &s) {
   }
   u8g2.drawStr(110, 12, buf);
 
-  // Circulation pump: a filter canister, or a snowflake during freeze protection
+  // Circulation pump: a filter canister whose pleats scroll down while it runs, or
+  // during freeze protection a snowflake turning 20° a frame (it repeats every 60°)
   tile(16, relays[CIRC_PUMP].on);
   if (freezeActive) {
-    u8g2.drawLine(108, 24, 118, 24);
-    u8g2.drawLine(110, 20, 116, 28);
-    u8g2.drawLine(110, 28, 116, 20);
+    spokes(113, 24, 5, 3, (frame % 3) * (float)M_PI / 9);
   } else {
     u8g2.drawRFrame(109, 19, 9, 11, 1);
-    u8g2.drawHLine(111, 23, 5);
-    u8g2.drawHLine(111, 26, 5);
+    uint8_t o = relays[CIRC_PUMP].on ? frame % 3 : 2;
+    for (uint8_t y = 21 + o; y <= 27; y += 3) u8g2.drawHLine(111, y, 5);
   }
 
-  // Big pump: an impeller
+  // Big pump: a 4-blade impeller, turning 30° a frame while the pump runs (the
+  // blades repeat every 90°, so 3 frames make a full cycle)
   tile(32, relays[BIG_PUMP].on);
   u8g2.drawCircle(113, 40, 5);
-  u8g2.drawLine(113, 35, 113, 45);
-  u8g2.drawLine(108, 40, 118, 40);
+  spokes(113, 40, 5, 2, relays[BIG_PUMP].on ? (frame % 3) * (float)M_PI / 6 : 0);
 
-  // Heater: a flame and the outlet temperature
+  // Heater: a flame, flickering while it burns (heater on and the big pump giving
+  // it flow), and the outlet temperature
   tile(48, relays[HEATER].on);
-  u8g2.drawTriangle(104, 50, 101, 59, 107, 59);
+  bool burning = relays[HEATER].on && relays[BIG_PUMP].on;
+  uint8_t tip = (burning && frame % 3 == 0) ? 52 : 50;  // the tip drops every 3rd frame
+  u8g2.drawTriangle(104, tip, 101, 59, 107, 59);
   u8g2.drawDisc(104, 59, 3, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
   if (fresh(s, P_HEATER)) snprintf(buf, sizeof(buf), "%ld", lroundf(toF(s.temp[P_HEATER])));
   else                    snprintf(buf, sizeof(buf), "--");
@@ -330,6 +351,28 @@ static void drawStatus(const Snapshot &s) {
 
   u8g2.setDrawColor(1);
   u8g2.sendBuffer();
+}
+
+// Redraws the status screen 4 times a second, so it can animate. The panel is on
+// when Hubitat's screen switch is on, and always during probe setup.
+static void display_task(void *arg) {
+  bool panelOn = true;
+  for (uint32_t frame = 0;; frame++) {
+    xSemaphoreTake(oledMutex, portMAX_DELAY);
+    bool setup = setupActive;  // read under the mutex, so it can't draw over a prompt
+    bool want = relays[SCREEN].on || setup;
+    if (want != panelOn) {
+      u8g2.setPowerSave(want ? 0 : 1);
+      panelOn = want;
+    }
+    if (want && !setup) {
+      Snapshot s = {};
+      xQueuePeek(snapQ, &s, 0);
+      drawStatus(s, frame);
+    }
+    xSemaphoreGive(oledMutex);
+    vTaskDelay(pdMS_TO_TICKS(250));
+  }
 }
 
 // Safety checks. Runs in its own task, started before the Zigbee wait in setup(),
@@ -566,7 +609,6 @@ static void temp_sensor_value_update(void *arg) {
   if (empty) setupRequested = true;
 
   Snapshot s = {};
-  bool screenOn = true;
   uint32_t lastSearch = millis();
 
   for (;;) {
@@ -578,9 +620,9 @@ static void temp_sensor_value_update(void *arg) {
       needSetup = newProbeOnBus(ds);
     }
     if (needSetup) {
-      if (displayOk) u8g2.setPowerSave(0);  // show the prompts
+      setupActive = true;  // the display task turns the panel on and stays out of the way
       setupProbes(ds, s);
-      screenOn = true;  // below, the screen switch from Hubitat is applied again
+      setupActive = false;
       for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
         log_i("Probe %s -> endpoint %u -> 0x%llx", probes[p].label, 10 + p, probes[p].addr);
       }
@@ -592,13 +634,6 @@ static void temp_sensor_value_update(void *arg) {
 
     readProbes(ds, s);
 
-    // The screen's state is set by the safety task (from Hubitat); only this task
-    // talks to the OLED, so the panel is switched here.
-    if (displayOk && relays[SCREEN].on != screenOn) {
-      screenOn = relays[SCREEN].on;
-      u8g2.setPowerSave(screenOn ? 0 : 1);
-    }
-    if (displayOk && screenOn) drawStatus(s);
     delay(1000);
   }
 }
@@ -606,6 +641,7 @@ static void temp_sensor_value_update(void *arg) {
 static void showPrompt(const char *label) {
   log_i("Probe setup: warm, cool or unplug the %s probe", label);
   if (!displayOk) return;
+  xSemaphoreTake(oledMutex, portMAX_DELAY);
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 10, "Probe setup");
@@ -613,6 +649,7 @@ static void showPrompt(const char *label) {
   u8g2.setFont(u8g2_font_helvB12_tf);
   u8g2.drawStr(0, 50, label);
   u8g2.sendBuffer();
+  xSemaphoreGive(oledMutex);
 }
 
 // The setup screen: the prompt, then one line per probe found so far (up to 4):
@@ -621,6 +658,7 @@ static void showPrompt(const char *label) {
 static void showSetup(const char *label, const Candidate *c, const float *t, const bool *ok, uint8_t n) {
   if (!displayOk) return;
   char buf[24];
+  xSemaphoreTake(oledMutex, portMAX_DELAY);
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 8, "Warm, cool or unplug:");
@@ -635,6 +673,7 @@ static void showSetup(const char *label, const Candidate *c, const float *t, con
     u8g2.drawStr(0, 32 + i * 10, buf);
   }
   u8g2.sendBuffer();
+  xSemaphoreGive(oledMutex);
 }
 
 // Search the bus once and add any new probes to c[]; returns the new count.
@@ -795,6 +834,9 @@ void setup() {
   // One-slot mailbox for Snapshot; see the comment at struct Snapshot.
   snapQ = xQueueCreate(1, sizeof(Snapshot));
   if (!snapQ) { log_e("snapshot queue alloc failed"); ESP.restart(); }
+
+  oledMutex = xSemaphoreCreateMutex();
+  if (displayOk) xTaskCreate(display_task, "display", 4096, NULL, 5, NULL);
 
   // Start Temperature sensor reading task
   xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
