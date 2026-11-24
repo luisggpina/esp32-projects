@@ -81,6 +81,14 @@ enum : uint8_t { P_OUTSIDE, P_TOP, P_BOTTOM, P_HEATER };  // indices into probes
 const float    SETUP_DELTA_C   = 2.0 / 1.8;  // 2 °F: a change this big picks the probe
 const uint32_t SETUP_UNPLUG_MS = 5000;       // no good read this long = unplugged
 
+// Temperature reports to the hub are sent by readProbes(), not left to the stack, so
+// a change is measured from the last values sent. When any probe has moved
+// REPORT_DELTA_C since the last report, or REPORT_MAX_MS have passed, every probe
+// with a good reading is reported, all in the same cycle (each endpoint sends its
+// own Report Attributes command).
+const float    REPORT_DELTA_C = 0.5 / 1.8;        // 0.5 °F
+const uint32_t REPORT_MAX_MS  = 5UL * 60 * 1000;  // at least every 5 min
+
 // Probe setup: ask for each role in turn (outside, water top, water bottom). The
 // first unassigned probe that changes by more than 2 °F, or stops answering for 5 s
 // and then answers again, gets that role. The heater is the probe left over. The bus
@@ -618,7 +626,8 @@ static bool newProbeOnBus(OneWire32 &ds) {
   return false;
 }
 
-// Read the mapped probes, update and publish the snapshot, report to Zigbee.
+// Read the mapped probes, update and publish the snapshot, and report to the hub
+// when it's due (see REPORT_DELTA_C).
 // The caller starts the conversion (ds.request() and the 750 ms wait).
 static void readProbes(OneWire32 &ds, Snapshot &s) {
   for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
@@ -633,6 +642,25 @@ static void readProbes(OneWire32 &ds, Snapshot &s) {
       log_v("Probe %s: read error", probes[p].label);
     }
   }
+
+  static float sentTemp[sizeof(probes) / sizeof(*probes)];  // values in the last report
+  static uint32_t sentAt = 0;                                // millis() of the last report
+  static bool sentOnce = false;
+  bool due = !sentOnce || millis() - sentAt >= REPORT_MAX_MS;
+  for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+    if (s.ok[p] && fabsf(s.temp[p] - sentTemp[p]) >= REPORT_DELTA_C) due = true;
+  }
+  if (due && Zigbee.connected()) {  // not joined yet: report once it is
+    for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
+      if (!s.ok[p]) continue;
+      zbTemps[p]->reportTemperature();
+      sentTemp[p] = s.temp[p];
+    }
+    sentAt = millis();
+    sentOnce = true;
+    log_d("Temperatures reported to the hub");
+  }
+
   xQueueOverwrite(snapQ, &s);  // publish this cycle's snapshot to all readers
 }
 
