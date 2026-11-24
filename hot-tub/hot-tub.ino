@@ -579,12 +579,33 @@ static void saveProbes() {
   prefs.end();
 }
 
+// A DS18B20 address ends in a CRC of its first 7 bytes. The bus search sometimes
+// returns an address with a bit wrong (seen: 0x32... for 0xb2...), so ignore any
+// address that doesn't check out.
+static bool romValid(uint64_t addr) {
+  uint8_t crc = 0;
+  for (uint8_t i = 0; i < 7; i++) {
+    uint8_t b = addr >> (8 * i);
+    for (uint8_t k = 0; k < 8; k++) {
+      bool mix = (crc ^ b) & 1;
+      crc >>= 1;
+      if (mix) crc ^= 0x8C;
+      b >>= 1;
+    }
+  }
+  return crc == (uint8_t)(addr >> 56);
+}
+
 // True if a probe on the bus isn't in the mapping. A missing probe doesn't count:
 // it reads as bad, and the safety checks handle that.
 static bool newProbeOnBus(OneWire32 &ds) {
   uint64_t found[8];
   uint8_t n = ds.search(found, sizeof(found)/sizeof(*found));
   for (uint8_t i = 0; i < n; i++) {
+    if (!romValid(found[i])) {
+      log_w("bus search: bad address 0x%llx ignored", found[i]);
+      continue;
+    }
     bool known = false;
     for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
       if (probes[p].addr == found[i]) known = true;
@@ -706,6 +727,7 @@ static uint8_t searchMore(OneWire32 &ds, Candidate *c, uint8_t n, uint8_t max) {
   uint64_t batch[8];
   uint8_t m = ds.search(batch, sizeof(batch)/sizeof(*batch));
   for (uint8_t j = 0; j < m; j++) {
+    if (!romValid(batch[j])) continue;
     bool seen = false;
     for (uint8_t i = 0; i < n; i++) if (c[i].addr == batch[j]) seen = true;
     if (!seen && n < max) {
