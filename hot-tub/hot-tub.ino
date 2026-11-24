@@ -46,14 +46,17 @@
 
 #include "Zigbee.h"
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h>
 #include <OneWireESP32.h>
 
 #include <esp_task_wdt.h>
 #include <atomic>
 
 #include <Preferences.h>
+
+#include <U8g2lib.h>
+
+// SH1106 128x64 on I2C (D4 = SDA, D5 = SCL), full frame buffer
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 /* Zigbee temperature sensor configuration */
 uint8_t button = BOOT_PIN;
@@ -119,6 +122,10 @@ QueueHandle_t snapQ;
 // when a new probe appears on the bus, or after 5 "on" commands for the screen
 // within 60 s.
 std::atomic<bool> setupRequested{false};
+
+// Set by the safety task, read by the display
+std::atomic<bool> freezeActive{false};
+std::atomic<bool> hotActive{false};
 
 // One Temperature Measurement endpoint per probe: probes[i] -> endpoint 10 + i
 ZigbeeTempSensor zbTemp1 = ZigbeeTempSensor(10);
@@ -218,8 +225,6 @@ static void setRelay(uint8_t r, bool on) {
   esp_zb_lock_release();
 }
 
-#define OLED_ADDR 0x3C
-Adafruit_SH1106G display(128, 64, &Wire, -1);
 bool displayOk = false;
 
 /************************ Temp sensor *****************************/
@@ -228,6 +233,103 @@ static bool assigned(uint64_t addr) {
     if (probes[p].addr == addr) return true;
   }
   return false;
+}
+
+static float toF(float c) { return c * 1.8f + 32.0f; }
+
+// A reading is shown if the probe had a good read in the last 30 s, so a single
+// read error doesn't blank it.
+static bool fresh(const Snapshot &s, uint8_t p) {
+  return s.at[p] != 0 && millis() - s.at[p] < 30000;
+}
+
+// A status tile in the right column: filled when on, outlined when off. Leaves the
+// draw color set for the icon (0 inside a filled tile, 1 otherwise).
+static void tile(uint8_t y, bool on) {
+  u8g2.setDrawColor(1);
+  if (on) { u8g2.drawRBox(98, y + 1, 30, 14, 2); u8g2.setDrawColor(0); }
+  else      u8g2.drawRFrame(98, y + 1, 30, 14, 2);
+}
+
+// The status screen. Left: the tub, with the water top temperature large near the
+// surface and the bottom temperature on the floor. Right, top to bottom: outside,
+// circulation pump (a snowflake during freeze protection), big pump, heater with
+// its outlet temperature.
+static void drawStatus(const Snapshot &s) {
+  char buf[12];
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+
+  // Tub, open at the top, with the water surface
+  u8g2.drawVLine(0, 2, 62);
+  u8g2.drawVLine(95, 2, 62);
+  u8g2.drawHLine(0, 63, 96);
+  for (uint8_t x = 2; x + 4 <= 94; x += 4) {
+    u8g2.drawLine(x, 5, x + 2, 3);
+    u8g2.drawLine(x + 2, 3, x + 4, 5);
+  }
+
+  // Water top: whole degrees large, the tenth small, right-aligned so the
+  // decimal doesn't move between 99 and 100
+  u8g2.setFont(u8g2_font_logisoso38_tn);
+  if (fresh(s, P_TOP)) {
+    long t10 = lroundf(toF(s.temp[P_TOP]) * 10);
+    snprintf(buf, sizeof(buf), "%ld", t10 / 10);
+    u8g2.drawStr(72 - u8g2.getStrWidth(buf), 50, buf);
+    u8g2.setFont(u8g2_font_helvB12_tn);
+    snprintf(buf, sizeof(buf), ".%ld", labs(t10 % 10));
+    u8g2.drawStr(74, 50, buf);
+    u8g2.drawCircle(88, 14, 2);  // °
+  } else {
+    u8g2.drawStr(30, 50, "--");
+  }
+
+  // Water bottom, on the floor of the tub
+  u8g2.setFont(u8g2_font_6x10_tf);
+  if (fresh(s, P_BOTTOM)) snprintf(buf, sizeof(buf), "%.1f\xb0", toF(s.temp[P_BOTTOM]));
+  else                    snprintf(buf, sizeof(buf), "--");
+  u8g2.drawStr(4, 61, buf);
+
+  // Outside: a tree and the whole degrees (no ° if it doesn't fit, e.g. -15)
+  u8g2.drawTriangle(103, 1, 99, 8, 107, 8);
+  u8g2.drawTriangle(103, 4, 98, 12, 108, 12);
+  u8g2.drawBox(102, 12, 3, 3);
+  if (fresh(s, P_OUTSIDE)) {
+    snprintf(buf, sizeof(buf), "%ld", lroundf(toF(s.temp[P_OUTSIDE])));
+    if (strlen(buf) < 3) strcat(buf, "\xb0");
+  } else {
+    snprintf(buf, sizeof(buf), "--");
+  }
+  u8g2.drawStr(110, 12, buf);
+
+  // Circulation pump: a filter canister, or a snowflake during freeze protection
+  tile(16, relays[CIRC_PUMP].on);
+  if (freezeActive) {
+    u8g2.drawLine(108, 24, 118, 24);
+    u8g2.drawLine(110, 20, 116, 28);
+    u8g2.drawLine(110, 28, 116, 20);
+  } else {
+    u8g2.drawRFrame(109, 19, 9, 11, 1);
+    u8g2.drawHLine(111, 23, 5);
+    u8g2.drawHLine(111, 26, 5);
+  }
+
+  // Big pump: an impeller
+  tile(32, relays[BIG_PUMP].on);
+  u8g2.drawCircle(113, 40, 5);
+  u8g2.drawLine(113, 35, 113, 45);
+  u8g2.drawLine(108, 40, 118, 40);
+
+  // Heater: a flame and the outlet temperature
+  tile(48, relays[HEATER].on);
+  u8g2.drawTriangle(104, 50, 101, 59, 107, 59);
+  u8g2.drawDisc(104, 59, 3, U8G2_DRAW_LOWER_LEFT | U8G2_DRAW_LOWER_RIGHT);
+  if (fresh(s, P_HEATER)) snprintf(buf, sizeof(buf), "%ld", lroundf(toF(s.temp[P_HEATER])));
+  else                    snprintf(buf, sizeof(buf), "--");
+  u8g2.drawStr(110, 60, buf);
+
+  u8g2.setDrawColor(1);
+  u8g2.sendBuffer();
 }
 
 // Safety checks. Runs in its own task, started before the Zigbee wait in setup(),
@@ -367,6 +469,8 @@ static void safety_task(void *arg) {
       }
     }
     if (hot && relays[BIG_PUMP].on) setRelay(BIG_PUMP, false);
+    freezeActive = freeze;  // for the display
+    hotActive = hot;
 
     if (now - lastDump >= 5000) {
       lastDump = now;
@@ -474,7 +578,7 @@ static void temp_sensor_value_update(void *arg) {
       needSetup = newProbeOnBus(ds);
     }
     if (needSetup) {
-      if (displayOk) display.oled_command(SH110X_DISPLAYON);  // show the prompts
+      if (displayOk) u8g2.setPowerSave(0);  // show the prompts
       setupProbes(ds, s);
       screenOn = true;  // below, the screen switch from Hubitat is applied again
       for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
@@ -492,60 +596,45 @@ static void temp_sensor_value_update(void *arg) {
     // talks to the OLED, so the panel is switched here.
     if (displayOk && relays[SCREEN].on != screenOn) {
       screenOn = relays[SCREEN].on;
-      display.oled_command(screenOn ? SH110X_DISPLAYON : SH110X_DISPLAYOFF);
+      u8g2.setPowerSave(screenOn ? 0 : 1);
     }
-    if (displayOk && screenOn) {
-      display.clearDisplay();
-      display.setTextColor(SH110X_WHITE);
-      display.setTextSize(2);
-      for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
-        display.setCursor(0, p * 16);
-        if (s.ok[p]) display.printf("%s %.1fF", probes[p].label, s.temp[p] * 9.0 / 5.0 + 32.0);
-        else       display.printf("%s --", probes[p].label);
-      }
-      display.display();
-    }
+    if (displayOk && screenOn) drawStatus(s);
     delay(1000);
   }
-}
-
-// The setup screen: the prompt, then one line per probe found so far (up to 5):
-// the last four hex digits of its serial number, its temperature, and its role once
-// assigned.
-static void showSetup(const char *label, const Candidate *c, const float *t, const bool *ok, uint8_t n) {
-  if (!displayOk) return;
-  display.clearDisplay();
-  display.setTextColor(SH110X_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print("Warm, cool or unplug:");
-  display.setTextSize(2);
-  display.setCursor(0, 8);
-  display.print(label);
-  display.setTextSize(1);
-  for (uint8_t i = 0; i < n && i < 5; i++) {
-    display.setCursor(0, 24 + i * 8);
-    unsigned id = (c[i].addr >> 8) & 0xFFFF;
-    const char *role = c[i].role ? c[i].role : "";
-    if (ok[i]) display.printf("%04X %5.1fF %s", id, t[i] * 1.8 + 32.0, role);
-    else       display.printf("%04X   --   %s", id, role);
-  }
-  display.display();
 }
 
 static void showPrompt(const char *label) {
   log_i("Probe setup: warm, cool or unplug the %s probe", label);
   if (!displayOk) return;
-  display.clearDisplay();
-  display.setTextColor(SH110X_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("Probe setup");
-  display.println();
-  display.println("Warm, cool or unplug:");
-  display.setTextSize(2);
-  display.println(label);
-  display.display();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 10, "Probe setup");
+  u8g2.drawStr(0, 30, "Warm, cool or unplug:");
+  u8g2.setFont(u8g2_font_helvB12_tf);
+  u8g2.drawStr(0, 50, label);
+  u8g2.sendBuffer();
+}
+
+// The setup screen: the prompt, then one line per probe found so far (up to 4):
+// the last four hex digits of its serial number, its temperature, and its role once
+// assigned.
+static void showSetup(const char *label, const Candidate *c, const float *t, const bool *ok, uint8_t n) {
+  if (!displayOk) return;
+  char buf[24];
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 8, "Warm, cool or unplug:");
+  u8g2.setFont(u8g2_font_helvB10_tf);
+  u8g2.drawStr(0, 21, label);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  for (uint8_t i = 0; i < n && i < 4; i++) {
+    unsigned id = (c[i].addr >> 8) & 0xFFFF;
+    const char *role = c[i].role ? c[i].role : "";
+    if (ok[i]) snprintf(buf, sizeof(buf), "%04X %5.1f\xb0 %s", id, toF(t[i]), role);
+    else       snprintf(buf, sizeof(buf), "%04X   --   %s", id, role);
+    u8g2.drawStr(0, 32 + i * 10, buf);
+  }
+  u8g2.sendBuffer();
 }
 
 // Search the bus once and add any new probes to c[]; returns the new count.
@@ -595,7 +684,7 @@ static void setupProbes(OneWire32 &ds, Snapshot &s) {
         oks[i] = ok;
         temps[i] = t;
         if (ok) {
-          log_d("  0x%016llx  %6.2f°C  %6.1f°F%s", c[i].addr, t, t * 1.8 + 32.0,
+          log_d("  0x%016llx  %6.2f°C  %6.1f°F%s", c[i].addr, t, toF(t),
                 c[i].taken ? "  (assigned)" : "");
         } else {
           log_d("  0x%016llx  --%s", c[i].addr, c[i].taken ? "  (assigned)" : "");
@@ -655,7 +744,7 @@ void setup() {
   Serial.setDebugOutput(true);
 
   Wire.begin();  // D4 = SDA, D5 = SCL on the XIAO
-  displayOk = display.begin(OLED_ADDR, true);
+  displayOk = u8g2.begin();
   if (!displayOk) {
     log_e("SH1106 not found - check wiring/address");
   }
@@ -665,6 +754,7 @@ void setup() {
 
   // Relays start off
   for (uint8_t r = 0; r < (sizeof(relays)/sizeof(*relays)); r++) {
+    if (relays[r].pin == NO_PIN) continue;
     pinMode(relays[r].pin, OUTPUT);
     digitalWrite(relays[r].pin, LOW);
   }
