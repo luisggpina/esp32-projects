@@ -24,6 +24,7 @@
  * Zigbee endpoints:
  *   10-13  Temperature Measurement, one per entry in probes[]
  *   14-16  On/Off for the big pump, circulation pump and heater (relays[])
+ *   17     On/Off for the screen (no relay)
  *
  * Wiring:
  *   D2     1-Wire bus for all four DS18B20s, 4.7k pull-up to 3V3
@@ -57,9 +58,8 @@
 /* Zigbee temperature sensor configuration */
 uint8_t button = BOOT_PIN;
 
-// One entry per DS18B20. Copy the addresses printed at boot into this table once you
-// know which sensor is which. An entry left at 0 is filled at boot with the next
-// unassigned sensor found on the bus, in search() order.
+// One entry per probe role. The addresses are assigned by probe setup and kept in
+// flash (see loadProbes()); an entry left at 0 has no probe.
 struct Probe {
   const char *label;  // shown on the OLED
   uint64_t addr;      // DS18B20 64-bit ROM address
@@ -75,11 +75,11 @@ Probe probes[] = {
 };
 enum : uint8_t { P_OUTSIDE, P_TOP, P_BOTTOM, P_HEATER };  // indices into probes[]
 
-const float    SETUP_DELTA_C   = 2.0 / 1.8;  // 5 °F: a change this big picks the probe
+const float    SETUP_DELTA_C   = 2.0 / 1.8;  // 2 °F: a change this big picks the probe
 const uint32_t SETUP_UNPLUG_MS = 5000;       // no good read this long = unplugged
 
 // Probe setup: ask for each role in turn (outside, water top, water bottom). The
-// first unassigned probe that changes by more than 5 °F, or stops answering for 5 s
+// first unassigned probe that changes by more than 2 °F, or stops answering for 5 s
 // and then answers again, gets that role. The heater is the probe left over. The bus
 // is searched again on every cycle, because a single search sometimes misses probes,
 // and every probe ever found is kept. The current mapping keeps being read and
@@ -116,7 +116,8 @@ struct Snapshot {
 QueueHandle_t snapQ;
 
 // Set to make the sensor task run probe setup: at boot with no stored mapping,
-// when a new probe appears on the bus, or after 5 screen toggles within 60 s.
+// when a new probe appears on the bus, or after 5 "on" commands for the screen
+// within 60 s.
 std::atomic<bool> setupRequested{false};
 
 // One Temperature Measurement endpoint per probe: probes[i] -> endpoint 10 + i
@@ -128,8 +129,8 @@ ZigbeeTempSensor *zbTemps[] = {&zbTemp1, &zbTemp2, &zbTemp3, &zbTemp4};
 static_assert(sizeof(zbTemps) / sizeof(*zbTemps) == sizeof(probes) / sizeof(*probes),
               "need one Zigbee endpoint per probe");
 
-// Relays: one On/Off endpoint per load, endpoints 14-16 (relays[i] -> endpoint 14 + i).
-// The pins drive the 4-channel opto-isolated DIN relay board, jumpered for high-level
+// Outputs: one On/Off endpoint each, endpoints 14-17 (relays[i] -> endpoint 14 + i).
+// The screen (17) has no relay. The pins drive the 4-channel opto-isolated DIN relay board, jumpered for high-level
 // trigger, so HIGH = on, and the relays stay off while the ESP32 is unpowered or
 // resetting. Keep the order in sync with RELAY_NAMES in hubitat_driver.groovy.
 ZigbeePowerOutlet zbRelay1 = ZigbeePowerOutlet(14);
@@ -163,8 +164,9 @@ const uint32_t PURGE_GAP_MS  = 2000;   // heater off -> big pump on
 const uint32_t PURGE_RUN_MS  = 30000;
 
 // Freeze protection: below 35 °F outside, the circulation pump is forced on and
-// Hubitat can't turn it off; above 38 °F it's released (and stays on until Hubitat
-// turns it off). With no good outside reading for 5 min, assume it's freezing.
+// Hubitat can't turn it off; above 36 °F it's released, and goes back to what
+// Hubitat last asked for. With no good outside reading for 5 min, assume it's
+// freezing.
 const float    FREEZE_ON_C     = (35.0 - 32.0) / 1.8;
 const float    FREEZE_OFF_C    = (36.0 - 32.0) / 1.8;
 const uint32_t FREEZE_STALE_MS = 5UL * 60 * 1000;
@@ -187,9 +189,9 @@ TaskHandle_t safetyTask = NULL;
 
 // Switch relay r and tell Hubitat. Only the safety task calls this, both for
 // Hubitat's commands and for the board's own changes (purge, safety checks).
-// It sets the endpoint's On/Off attribute itself and always sends an explicit
-// report, because the library doesn't report the board's own changes (seen in
-// testing). The report goes straight to the hub (coordinator 0x0000, endpoint 1),
+// It sets the endpoint's On/Off attribute itself and sends an On/Off command to the
+// hub, because the library doesn't report the board's own changes (seen in
+// testing). The command goes straight to the hub (coordinator 0x0000, endpoint 1),
 // so it doesn't depend on bindings.
 static void setRelay(uint8_t r, bool on) {
   if (relays[r].pin != NO_PIN) digitalWrite(relays[r].pin, on ? HIGH : LOW);
@@ -249,7 +251,7 @@ static void safety_task(void *arg) {
   bool hot = false;                 // over-temperature active
   bool circWanted = false;          // what Hubitat last asked for the circ pump (off at boot)
 
-  uint32_t toggles[5] = {};         // times of the last 5 screen changes from Hubitat
+  uint32_t toggles[5] = {};         // times of the last 5 "on" commands for the screen
   uint8_t toggleNext = 0, toggleCount = 0;
 
   for (;;) {
@@ -332,8 +334,10 @@ static void safety_task(void *arg) {
         break;
     }
 
-    // Freeze protection, from the outside probe. Before the first snapshot, s is all
-    // zero, so the probe's last good read is at 0 and it goes stale after 5 min of uptime.
+    // Freeze protection, from the outside probe. Before the first snapshot, fs is all
+    // zero: the probe reads 0 °C, which turns freeze protection on until the first
+    // reading arrives, and its last good read is at 0, so it goes stale after 5 min
+    // of uptime.
     Snapshot fs = {};
     xQueuePeek(snapQ, &fs, 0);
     bool stale = now - fs.at[P_OUTSIDE] >= FREEZE_STALE_MS;
@@ -462,8 +466,8 @@ static void temp_sensor_value_update(void *arg) {
   uint32_t lastSearch = millis();
 
   for (;;) {
-    // Probe setup: requested (boot, screen toggles), or a new probe on the bus,
-    // checked once a minute.
+    // Probe setup: requested (boot, 5 "on" commands for the screen), or a new probe
+    // on the bus, checked once a minute.
     bool needSetup = setupRequested.exchange(false);
     if (!needSetup && millis() - lastSearch >= 60000) {
       lastSearch = millis();
@@ -714,7 +718,7 @@ void setup() {
   log_i("Connected to network");
 
   // Set reporting interval for temperature measurement in seconds, must be called after Zigbee.begin()
-  // min_interval and max_interval in seconds, delta (temp change in 0,1 °C)
+  // min_interval and max_interval in seconds, delta in °C
   // if min = 1 and max = 0, reporting is sent only when temperature changes by delta
   // if min = 0 and max = 10, reporting is sent every 10 seconds or temperature changes by delta
   // if min = 0, max = 10 and delta = 0, reporting is sent every 10 seconds regardless of temperature change
@@ -724,9 +728,9 @@ void setup() {
 }
 
 
-// Called on every relay change: by the Zigbee task when Hubitat sends a command,
-// and by setState() in whichever task calls it. Changes made by the safety task
-// itself are applied directly; everything else is queued for it.
+// Called by the library when Hubitat sends a command for an output, in the Zigbee
+// task: the command is queued for the safety task. A change made from the safety
+// task itself (through setState(), which nothing calls today) is applied directly.
 static void onRelayChange(uint8_t r, bool on) {
   if (xTaskGetCurrentTaskHandle() == safetyTask) {
     setRelay(r, on);
