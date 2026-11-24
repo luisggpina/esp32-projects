@@ -133,6 +133,10 @@ std::atomic<bool> hotActive{false};
 SemaphoreHandle_t oledMutex;
 std::atomic<bool> setupActive{false};
 
+// Set in setup() when the board has never joined a network (first pairing, or after
+// a factory reset): the display task then shows the join progress.
+std::atomic<bool> pairing{false};
+
 // One Temperature Measurement endpoint per probe: probes[i] -> endpoint 10 + i
 ZigbeeTempSensor zbTemp1 = ZigbeeTempSensor(10);
 ZigbeeTempSensor zbTemp2 = ZigbeeTempSensor(11);
@@ -355,22 +359,41 @@ static void drawStatus(const Snapshot &s, uint32_t frame) {
   u8g2.sendBuffer();
 }
 
+// A two-line message in place of the status screen, with dots that keep moving so
+// it's clear the board hasn't hung.
+static void drawMessage(const char *title, const char *detail, uint32_t frame) {
+  u8g2.clearBuffer();
+  u8g2.setDrawColor(1);
+  u8g2.setFont(u8g2_font_helvB10_tf);
+  u8g2.drawStr(0, 24, title);
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 44, detail);
+  uint8_t x = u8g2.getStrWidth(detail) + 2;
+  for (uint8_t i = 0; i < frame % 4; i++) u8g2.drawBox(x + 4 * i, 42, 2, 2);
+  u8g2.sendBuffer();
+}
+
 // Redraws the status screen 4 times a second, so it can animate. The panel is on
-// when Hubitat's screen switch is on, and always during probe setup.
+// when Hubitat's screen switch is on, and always during the first pairing and probe
+// setup. Until the first readings arrive it shows the join progress instead: the
+// board can only tell whether it has joined, not what the hub is doing after that.
 static void display_task(void *arg) {
   bool panelOn = true;
   for (uint32_t frame = 0;; frame++) {
     xSemaphoreTake(oledMutex, portMAX_DELAY);
     bool setup = setupActive;  // read under the mutex, so it can't draw over a prompt
-    bool want = relays[SCREEN].on || setup;
+    bool joining = pairing && !Zigbee.connected();
+    bool want = relays[SCREEN].on || setup || joining;
     if (want != panelOn) {
       u8g2.setPowerSave(want ? 0 : 1);
       panelOn = want;
     }
     if (want && !setup) {
       Snapshot s = {};
-      xQueuePeek(snapQ, &s, 0);
-      drawStatus(s, frame);
+      bool haveData = xQueuePeek(snapQ, &s, 0) == pdTRUE;
+      if (joining)        drawMessage("Looking for hub", "Pair it from Hubitat", frame);
+      else if (!haveData) drawMessage(pairing ? "Hub found" : "Starting", "Initializing", frame);
+      else                drawStatus(s, frame);
     }
     xSemaphoreGive(oledMutex);
     vTaskDelay(pdMS_TO_TICKS(250));
@@ -837,14 +860,16 @@ void setup() {
   snapQ = xQueueCreate(1, sizeof(Snapshot));
   if (!snapQ) { log_e("snapshot queue alloc failed"); ESP.restart(); }
 
-  oledMutex = xSemaphoreCreateMutex();
-  if (displayOk) xTaskCreate(display_task, "display", 4096, NULL, 5, NULL);
-
   // A new board (never joined, or after a factory reset) waits for the join before
   // starting the tasks, so nothing touches the stack while it's being commissioned.
   // A board that has joined before starts them right away, so the safety checks run
   // even if the hub is down.
   bool firstJoin = esp_zb_bdb_is_factory_new();
+  pairing = firstJoin;
+
+  oledMutex = xSemaphoreCreateMutex();
+  if (displayOk) xTaskCreate(display_task, "display", 4096, NULL, 5, NULL);
+
   if (!firstJoin) {
     xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
     xTaskCreate(safety_task, "safety", 4096, NULL, 11, &safetyTask);
