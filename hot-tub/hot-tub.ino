@@ -194,7 +194,7 @@ TaskHandle_t safetyTask = NULL;
 static void setRelay(uint8_t r, bool on) {
   if (relays[r].pin != NO_PIN) digitalWrite(relays[r].pin, on ? HIGH : LOW);
   relays[r].on = on;
-  Serial.printf("%s (endpoint %u) %s\r\n", relays[r].name, 14 + r, on ? "on" : "off");
+  log_i("%s (endpoint %u) %s", relays[r].name, 14 + r, on ? "on" : "off");
 
   // Keep the endpoint's On/Off attribute in step with the relay, and tell Hubitat:
   // send an On/Off command for the new state from this relay's endpoint to the hub
@@ -237,7 +237,7 @@ static void safety_task(void *arg) {
   // panic on expiry, so if this task stops feeding it, the board resets and the
   // relays fail off.
   if (esp_task_wdt_add(NULL) != ESP_OK) {
-    Serial.println("safety: could not subscribe to the task watchdog");
+    log_e("safety: could not subscribe to the task watchdog");
   }
 
   enum { PURGE_IDLE, PURGE_GAP, PURGE_RUN } purge = PURGE_IDLE;
@@ -271,7 +271,7 @@ static void safety_task(void *arg) {
     RelayCmd c;
     if (xQueueReceive(cmdQ, &c, pdMS_TO_TICKS(1000)) == pdTRUE) {
       if (purge != PURGE_IDLE && c.relay != SCREEN) {
-        Serial.println("purge: ended by a command");
+        log_i("purge: ended by a command");
         if (purge == PURGE_RUN) {
           setRelay(BIG_PUMP, false);
           delay(1000);  // let the pump stop before running the command
@@ -285,17 +285,17 @@ static void safety_task(void *arg) {
         toggleNext = (toggleNext + 1) % 5;
         if (toggleCount < 5) toggleCount++;
         if (toggleCount == 5 && t - toggles[toggleNext] <= 60000) {
-          Serial.println("Screen on 5 times in 60 s: probe setup requested");
+          log_i("Screen on 5 times in 60 s: probe setup requested");
           setupRequested = true;
           toggleCount = 0;
         }
       }
       if (c.relay == CIRC_PUMP) circWanted = c.on;
       if (freeze && c.relay == CIRC_PUMP && !c.on) {
-        Serial.println("freeze protection: circ pump stays on");
+        log_w("freeze protection: circ pump stays on");
         setRelay(CIRC_PUMP, true);   // put the attribute back and tell Hubitat
       } else if (hot && c.relay == BIG_PUMP && c.on) {
-        Serial.println("over-temperature: big pump stays off");
+        log_w("over-temperature: big pump stays off");
         setRelay(BIG_PUMP, false);   // put the attribute back and tell Hubitat
       } else {
         setRelay(c.relay, c.on);
@@ -309,7 +309,7 @@ static void safety_task(void *arg) {
     switch (purge) {
       case PURGE_IDLE:
         if (now - pumpLastOn >= PURGE_IDLE_MS) {
-          Serial.println("purge: heater off");
+          log_i("purge: heater off");
           setRelay(HEATER, false);
           purge = PURGE_GAP;
           purgeAt = now;
@@ -317,7 +317,7 @@ static void safety_task(void *arg) {
         break;
       case PURGE_GAP:
         if (now - purgeAt >= PURGE_GAP_MS) {
-          Serial.println("purge: big pump on");
+          log_i("purge: big pump on");
           setRelay(BIG_PUMP, true);
           purge = PURGE_RUN;
           purgeAt = now;
@@ -325,7 +325,7 @@ static void safety_task(void *arg) {
         break;
       case PURGE_RUN:
         if (now - purgeAt >= PURGE_RUN_MS) {
-          Serial.println("purge: big pump off");
+          log_i("purge: big pump off");
           setRelay(BIG_PUMP, false);
           purge = PURGE_IDLE;
         }
@@ -342,8 +342,8 @@ static void safety_task(void *arg) {
     if (stale || outside < FREEZE_ON_C) freeze = true;
     else if (outside > FREEZE_OFF_C)    freeze = false;
     if (freeze != wasFreeze) {
-      Serial.printf("freeze protection %s (%s)\r\n", freeze ? "on" : "off",
-                    stale ? "no outside reading for 5 min" : "outside temperature");
+      if (stale) log_w("freeze protection on (no outside reading for 5 min)");
+      else       log_i("freeze protection %s (outside temperature)", freeze ? "on" : "off");
       if (!freeze) setRelay(CIRC_PUMP, circWanted);  // back to what Hubitat last asked for
     }
     if (freeze && !relays[CIRC_PUMP].on) setRelay(CIRC_PUMP, true);
@@ -355,10 +355,10 @@ static void safety_task(void *arg) {
     if (topStale || top >= HOT_ON_C) hot = true;
     else if (top < HOT_OFF_C)        hot = false;
     if (hot != wasHot) {
-      Serial.printf("over-temperature %s (%s)\r\n", hot ? "on" : "off",
-                    topStale ? "no water top reading for 5 min" : "water top temperature");
+      if (topStale) log_w("over-temperature on (no water top reading for 5 min)");
+      else          log_i("over-temperature %s (water top temperature)", hot ? "on" : "off");
       if (hot && purge != PURGE_IDLE) {
-        Serial.println("purge: ended by over-temperature");
+        log_i("purge: ended by over-temperature");
         purge = PURGE_IDLE;
       }
     }
@@ -369,11 +369,11 @@ static void safety_task(void *arg) {
       Snapshot s;
       if (xQueuePeek(snapQ, &s, 0) == pdTRUE) {
         for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
-          Serial.printf("snap %s: %s %.2f°C, %lu ms old\r\n", probes[p].label,
-                        s.ok[p] ? "ok " : "bad", s.temp[p], (unsigned long)(now - s.at[p]));
+          log_v("snap %s: %s %.2f°C, %lu ms old", probes[p].label,
+                s.ok[p] ? "ok " : "bad", s.temp[p], (unsigned long)(now - s.at[p]));
         }
       } else {
-        Serial.println("snap: no data yet");
+        log_v("snap: no data yet");
       }
     }
   }
@@ -387,7 +387,7 @@ static void loadProbes() {
     char key[4];
     snprintf(key, sizeof(key), "p%u", p);
     probes[p].addr = prefs.getULong64(key, 0);
-    Serial.printf("Stored %s -> 0x%llx\r\n", probes[p].label, probes[p].addr);
+    log_i("Stored %s -> 0x%llx", probes[p].label, probes[p].addr);
   }
   prefs.end();
 }
@@ -414,7 +414,7 @@ static bool newProbeOnBus(OneWire32 &ds) {
       if (probes[p].addr == found[i]) known = true;
     }
     if (!known) {
-      Serial.printf("New probe 0x%llx on the bus: starting probe setup\r\n", found[i]);
+      log_i("New probe 0x%llx on the bus: starting probe setup", found[i]);
       return true;
     }
   }
@@ -430,10 +430,10 @@ static void readProbes(OneWire32 &ds, Snapshot &s) {
     if (s.ok[p]) {
       s.temp[p] = t;
       s.at[p] = millis();
-      Serial.printf("Probe %s: %.2f°C\r\n", probes[p].label, t);
+      log_v("Probe %s: %.2f°C", probes[p].label, t);
       zbTemps[p]->setTemperature(t);
     } else {
-      Serial.printf("Probe %s: read error\r\n", probes[p].label);
+      log_v("Probe %s: read error", probes[p].label);
     }
   }
   xQueueOverwrite(snapQ, &s);  // publish this cycle's snapshot to all readers
@@ -445,9 +445,9 @@ static void temp_sensor_value_update(void *arg) {
   OneWire32 ds(D2);
   uint64_t addr[(sizeof(probes)/sizeof(*probes))];
   uint8_t found = ds.search(addr, (sizeof(probes)/sizeof(*probes)));
-  Serial.printf("Found %u DS18B20 sensor(s)\r\n", found);
+  log_i("Found %u DS18B20 sensor(s)", found);
   for (uint8_t i = 0; i < found; i++) {
-    Serial.printf("  %u: 0x%llx\r\n", i, addr[i]);
+    log_i("  %u: 0x%llx", i, addr[i]);
   }
 
   // No stored mapping (first boot, or after clearing it): ask which probe is which.
@@ -474,7 +474,7 @@ static void temp_sensor_value_update(void *arg) {
       setupProbes(ds, s);
       screenOn = true;  // below, the screen switch from Hubitat is applied again
       for (uint8_t p = 0; p < (sizeof(probes)/sizeof(*probes)); p++) {
-        Serial.printf("Probe %s -> endpoint %u -> 0x%llx\r\n", probes[p].label, 10 + p, probes[p].addr);
+        log_i("Probe %s -> endpoint %u -> 0x%llx", probes[p].label, 10 + p, probes[p].addr);
       }
       lastSearch = millis();
     }
@@ -530,7 +530,7 @@ static void showSetup(const char *label, const Candidate *c, const float *t, con
 }
 
 static void showPrompt(const char *label) {
-  Serial.printf("Probe setup: warm, cool or unplug the %s probe\r\n", label);
+  log_i("Probe setup: warm, cool or unplug the %s probe", label);
   if (!displayOk) return;
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
@@ -553,7 +553,7 @@ static uint8_t searchMore(OneWire32 &ds, Candidate *c, uint8_t n, uint8_t max) {
     for (uint8_t i = 0; i < n; i++) if (c[i].addr == batch[j]) seen = true;
     if (!seen && n < max) {
       c[n] = {batch[j], false, false, false, 0.0f, millis()};
-      Serial.printf("Probe setup: found 0x%llx\r\n", batch[j]);
+      log_d("Probe setup: found 0x%llx", batch[j]);
       n++;
     }
   }
@@ -584,17 +584,17 @@ static void setupProbes(OneWire32 &ds, Snapshot &s) {
       delay(750);
       readProbes(ds, s);
 
-      Serial.printf("Probe setup (%s):\r\n", probes[role].label);
+      log_d("Probe setup (%s):", probes[role].label);
       for (uint8_t i = 0; i < n; i++) {
         float t;
         bool ok = ds.getTemp(c[i].addr, t) == 0;
         oks[i] = ok;
         temps[i] = t;
         if (ok) {
-          Serial.printf("  0x%016llx  %6.2f°C  %6.1f°F%s\r\n", c[i].addr, t, t * 1.8 + 32.0,
-                        c[i].taken ? "  (assigned)" : "");
+          log_d("  0x%016llx  %6.2f°C  %6.1f°F%s", c[i].addr, t, t * 1.8 + 32.0,
+                c[i].taken ? "  (assigned)" : "");
         } else {
-          Serial.printf("  0x%016llx  --%s\r\n", c[i].addr, c[i].taken ? "  (assigned)" : "");
+          log_d("  0x%016llx  --%s", c[i].addr, c[i].taken ? "  (assigned)" : "");
         }
 
         if (c[i].taken || done) continue;
@@ -603,7 +603,7 @@ static void setupProbes(OneWire32 &ds, Snapshot &s) {
             assigned[role] = c[i].addr;
             c[i].taken = true;
             done = true;
-            Serial.printf("Probe setup: %s -> 0x%llx\r\n", probes[role].label, c[i].addr);
+            log_i("Probe setup: %s -> 0x%llx", probes[role].label, c[i].addr);
           } else if (!c[i].haveBase) {
             c[i].base = t;
             c[i].haveBase = true;
@@ -623,7 +623,7 @@ static void setupProbes(OneWire32 &ds, Snapshot &s) {
   for (uint8_t i = 0; i < n; i++) {
     if (!c[i].taken) {
       assigned[P_HEATER] = c[i].addr;
-      Serial.printf("Probe setup: %s -> 0x%llx\r\n", probes[P_HEATER].label, c[i].addr);
+      log_i("Probe setup: %s -> 0x%llx", probes[P_HEATER].label, c[i].addr);
       break;
     }
   }
@@ -639,12 +639,21 @@ void setup() {
   pinMode(3, OUTPUT);  digitalWrite(3, LOW);   // enable RF switch (active low)
   pinMode(14, OUTPUT); digitalWrite(14, LOW);  // LOW = onboard ceramic antenna
 
+  // Messages go through the core's log macros (log_e, log_w, log_i, log_d, log_v),
+  // which print only up to the level set at build time (DebugLevel in the FQBN):
+  //   error    failures the board can't recover from by itself
+  //   warning  problems that were handled (a dropped command, a stale probe)
+  //   info     events: relays, purge, safety checks, joins, probe setup steps
+  //   debug    the probe list on every probe setup cycle
+  //   verbose  every probe reading, and the snapshot every 5 s
+  // setDebugOutput() sends them to the USB serial port.
   Serial.begin(115200);
+  Serial.setDebugOutput(true);
 
   Wire.begin();  // D4 = SDA, D5 = SCL on the XIAO
   displayOk = display.begin(OLED_ADDR, true);
   if (!displayOk) {
-    Serial.println("SH1106 not found - check wiring/address");
+    log_e("SH1106 not found - check wiring/address");
   }
 
   // Init button switch
@@ -678,33 +687,31 @@ void setup() {
   }
 
   cmdQ = xQueueCreate(8, sizeof(RelayCmd));
-  if (!cmdQ) { Serial.println("command queue alloc failed"); ESP.restart(); }
+  if (!cmdQ) { log_e("command queue alloc failed"); ESP.restart(); }
 
-  Serial.println("Starting Zigbee...");
+  log_i("Starting Zigbee...");
   // When all EPs are registered, start Zigbee in Router mode
   if (!Zigbee.begin(ZIGBEE_ROUTER)) {
-    Serial.println("Zigbee failed to start!");
-    Serial.println("Rebooting...");
+    log_e("Zigbee failed to start! Rebooting...");
     ESP.restart();
   } else {
-    Serial.println("Zigbee started successfully!");
+    log_i("Zigbee started successfully!");
   }
 
   // One-slot mailbox for Snapshot; see the comment at struct Snapshot.
   snapQ = xQueueCreate(1, sizeof(Snapshot));
-  if (!snapQ) { Serial.println("snapshot queue alloc failed"); ESP.restart(); }
+  if (!snapQ) { log_e("snapshot queue alloc failed"); ESP.restart(); }
 
   // Start Temperature sensor reading task
   xTaskCreate(temp_sensor_value_update, "temp_sensor_update", 4096, NULL, 10, NULL);
 
   xTaskCreate(safety_task, "safety", 4096, NULL, 11, &safetyTask);
 
-  Serial.println("Connecting to network");
+  log_i("Connecting to network");
   while (!Zigbee.connected()) {
-    Serial.print(".");
     delay(100);
   }
-  Serial.println();
+  log_i("Connected to network");
 
   // Set reporting interval for temperature measurement in seconds, must be called after Zigbee.begin()
   // min_interval and max_interval in seconds, delta (temp change in 0,1 °C)
@@ -726,7 +733,7 @@ static void onRelayChange(uint8_t r, bool on) {
   } else {
     RelayCmd c = {r, on};
     if (xQueueSend(cmdQ, &c, 0) != pdTRUE) {
-      Serial.printf("%s: command queue full, command dropped\r\n", relays[r].name);
+      log_w("%s: command queue full, command dropped", relays[r].name);
     }
   }
 }
@@ -742,7 +749,7 @@ void loop() {
       delay(50);
       if ((millis() - startTime) > 3000) {
         // If key pressed for more than 3secs, factory reset Zigbee and reboot
-        Serial.println("Resetting Zigbee to factory and rebooting in 1s.");
+        log_i("Resetting Zigbee to factory and rebooting in 1s.");
         delay(1000);
         Zigbee.factoryReset();
       }
